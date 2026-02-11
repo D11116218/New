@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "faster-rcnn-project"
+version = "0.1.0"
+description = "Faster R-CNN 物體偵測專案 - 優化支援 RTX 5090"
+authors = ["willes.chen"]
+readme = "完整使用說明.md"
+packages = [{include = "*", from = "."}]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+# 注意：PyTorch 和 torchvision 使用 Nightly 版本以支援 RTX 5090 (sm_120)
+# 已安裝 CUDA 12.8 Nightly 版本
+# 安裝指令：poetry run pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+pillow = ">=8.0.0"
+opencv-python = ">=4.5.0"
+matplotlib = ">=3.3.0"
+numpy = ">=1.21.0"
+
+[tool.poetry.scripts]
+tococo = "tococo:main"
+preprocessing = "Preprocessing:main"
+train = "model:main"
+mark = "mark:main"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
