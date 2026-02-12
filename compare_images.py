@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-比對 model/train/images 和 model/val/images 資料夾中相同名稱的檔案
-"""
 
 import os
 from pathlib import Path

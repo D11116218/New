@@ -1,7 +1,4 @@
-"""
-標註格式轉換工具：將手動標記的 JSON 格式轉換為 COCO 格式
-從 c1/ 讀取原始標註，轉換後輸出到 c2/
-"""
+
 
 import os
 import json
@@ -10,19 +7,11 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from PIL import Image
 
-
 class AnnotationConverter:
-    """標註格式轉換器"""
+    
     
     def __init__(self, input_dir: str = "c1", output_dir: str = "c2", category_name: str = "object"):
-        """
-        初始化轉換器
         
-        Args:
-            input_dir: 輸入目錄（未轉換的資料，包含圖片和 JSON）
-            output_dir: 輸出目錄（已轉換的 COCO 格式）
-            category_name: 類別名稱（預設為 "object"）
-        """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.category_name = category_name
@@ -36,12 +25,7 @@ class AnnotationConverter:
         self.image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.BMP']
     
     def detect_format(self, json_data: Dict) -> str:
-        """
-        自動檢測 JSON 格式
         
-        Returns:
-            'labelme', 'single_json', 'coco', 'unknown'
-        """
         # 檢查是否為 LabelMe 格式
         if 'shapes' in json_data and 'imagePath' in json_data:
             return 'labelme'
@@ -57,17 +41,7 @@ class AnnotationConverter:
         return 'unknown'
     
     def convert_labelme_bbox(self, shape: Dict, image_width: int, image_height: int) -> Optional[List[float]]:
-        """
-        將 LabelMe 格式的標註轉換為 COCO bbox 格式 [x_min, y_min, width, height]
         
-        Args:
-            shape: LabelMe 的 shape 物件
-            image_width: 圖片寬度
-            image_height: 圖片高度
-            
-        Returns:
-            COCO 格式的 bbox [x_min, y_min, width, height]，如果無法轉換則返回 None
-        """
         shape_type = shape.get('shape_type', '').lower()
         points = shape.get('points', [])
         
@@ -127,12 +101,7 @@ class AnnotationConverter:
         return None
     
     def convert_labelme_file(self, json_path: Path, image_path: Path) -> Optional[Dict]:
-        """
-        轉換單個 LabelMe JSON 檔案
         
-        Returns:
-            包含圖像資訊和標註的字典，如果失敗則返回 None
-        """
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 labelme_data = json.load(f)
@@ -175,12 +144,7 @@ class AnnotationConverter:
             return None
     
     def convert_single_json(self, json_path: Path) -> Optional[Dict]:
-        """
-        轉換單一 JSON 檔案（包含所有標註）
         
-        Returns:
-            COCO 格式的數據字典，如果失敗則返回 None
-        """
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -201,12 +165,7 @@ class AnnotationConverter:
             return None
     
     def convert_all(self) -> Dict:
-        """
-        轉換所有標註檔案
         
-        Returns:
-            轉換結果統計
-        """
         print("=" * 60)
         print("開始轉換標註格式")
         print("=" * 60)
@@ -398,9 +357,8 @@ class AnnotationConverter:
             "output_images_dir": str(self.output_images_dir)
         }
 
-
 def main():
-    """主函數"""
+    
     print("標註格式轉換工具：轉換為 COCO 格式")
     print()
     print("使用說明：")
@@ -455,7 +413,6 @@ def main():
         print(f"  3. 執行 data_preparation.py 進行預處理")
     else:
         print("✗ 轉換失敗，請檢查錯誤訊息")
-
 
 if __name__ == "__main__":
     main()

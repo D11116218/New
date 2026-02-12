@@ -1,26 +1,12 @@
-"""
-標註錯誤檢查工具
-檢查是否有 colony 和 point 標註錯誤的情況
-根據 bbox 大小來判斷可能的標註錯誤
-"""
+
 
 import json
 from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
-
 def analyze_bbox_sizes(annotation_file: str, category_mapping: Dict[int, str]) -> Dict[str, Dict]:
-    """
-    分析每個類別的 bbox 大小分佈
     
-    Args:
-        annotation_file: COCO 格式標註檔案路徑
-        category_mapping: category_id -> category_name 的映射
-    
-    Returns:
-        每個類別的統計資訊
-    """
     annotation_path = Path(annotation_file)
     if not annotation_path.exists():
         return {}
@@ -90,21 +76,13 @@ def analyze_bbox_sizes(annotation_file: str, category_mapping: Dict[int, str]) -
     
     return result
 
-
 def find_potential_errors(
     annotation_file: str,
     category_mapping: Dict[int, str],
     colony_stats: Dict,
     point_stats: Dict
 ) -> List[Dict]:
-    """
-    找出可能的標註錯誤
     
-    假設：
-    - colony 通常比 point 大
-    - 如果一個標記為 colony 的 bbox 很小，可能是誤標為 colony 的 point
-    - 如果一個標記為 point 的 bbox 很大，可能是誤標為 point 的 colony
-    """
     annotation_path = Path(annotation_file)
     if not annotation_path.exists():
         return []
@@ -194,9 +172,8 @@ def find_potential_errors(
     
     return potential_errors
 
-
 def main():
-    """主函數"""
+    
     print("=" * 60)
     print("標註錯誤檢查工具")
     print("=" * 60)
@@ -298,7 +275,6 @@ def main():
     print("檢查完成")
     print("=" * 60)
     print("\n注意: 此工具僅根據 bbox 大小進行推測，實際標註是否錯誤需要人工確認")
-
 
 if __name__ == "__main__":
     main()

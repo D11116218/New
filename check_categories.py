@@ -1,21 +1,12 @@
-"""
-類別定義檢查工具
-檢查原始標註資料和訓練資料中的類別定義是否一致
-"""
+
 
 import json
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Dict, Set, List
 
-
 def collect_categories_from_source(source_dir: str) -> Dict[str, int]:
-    """
-    從原始標註檔案（c1/）收集所有類別名稱及其出現次數
     
-    Returns:
-        類別名稱 -> 出現次數的字典
-    """
     source_path = Path(source_dir)
     if not source_path.exists():
         print(f"錯誤: 目錄不存在: {source_dir}")
@@ -66,14 +57,8 @@ def collect_categories_from_source(source_dir: str) -> Dict[str, int]:
     
     return dict(category_counter)
 
-
 def check_coco_categories(annotation_file: str) -> Dict[int, str]:
-    """
-    檢查 COCO 格式標註檔案中的類別定義
     
-    Returns:
-        category_id -> category_name 的字典
-    """
     annotation_path = Path(annotation_file)
     if not annotation_path.exists():
         print(f"錯誤: 檔案不存在: {annotation_file}")
@@ -99,23 +84,12 @@ def check_coco_categories(annotation_file: str) -> Dict[int, str]:
     
     return categories
 
-
 def check_category_mapping(
     source_categories: Dict[str, int],
     coco_categories: Dict[int, str],
     expected_order: List[str] = None
 ) -> bool:
-    """
-    檢查類別映射是否正確
     
-    Args:
-        source_categories: 原始標註中的類別統計
-        coco_categories: COCO 格式中的類別定義
-        expected_order: 預期的類別順序（用於驗證 ID 分配）
-    
-    Returns:
-        是否一致
-    """
     print("\n" + "=" * 60)
     print("類別映射檢查")
     print("=" * 60)
@@ -179,11 +153,8 @@ def check_category_mapping(
     
     return all_match and len(unused) == 0
 
-
 def analyze_annotation_distribution(annotation_file: str, coco_categories: Dict[int, str]):
-    """
-    分析標註中每個類別的使用情況
-    """
+    
     annotation_path = Path(annotation_file)
     if not annotation_path.exists():
         return
@@ -207,9 +178,8 @@ def analyze_annotation_distribution(annotation_file: str, coco_categories: Dict[
         count = category_counts[cat_id]
         print(f"  id:{cat_id} '{cat_name}': {count} 個標註")
 
-
 def main():
-    """主函數"""
+    
     print("=" * 60)
     print("類別定義檢查工具")
     print("=" * 60)
@@ -291,7 +261,6 @@ def main():
         print("  1. 檢查原始標註檔案中的類別名稱是否一致（大小寫、拼寫）")
         print("  2. 確認 tococo.py 轉換時類別 ID 分配是否正確")
         print("  3. 確認訓練資料和驗證資料使用相同的類別定義")
-
 
 if __name__ == "__main__":
     main()
