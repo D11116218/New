@@ -65,23 +65,25 @@ PREPROCESS_CONTRAST_ALPHA = 1.0   # 對比度增強係數
 SAVE_GRAYSCALE = True  # 是否保存灰階圖片到 grayscale/
 
 # 二值化配置
-BINARY_PETRI_DISH_THRESHOLD = 30  # 培養皿與背景分割的閾值（黑色背景 < 30）
+BINARY_PETRI_DISH_THRESHOLD = 40  # 培養皿與背景分割的閾值（黑色背景 < 30）
 BINARY_OBJECTS_THRESHOLD = 127    # 物件分割的閾值（Otsu 自動閾值或固定閾值）
 BINARY_USE_OTSU = True            # 是否使用 Otsu 自動閾值進行物件分割
 
 # RFID 遮罩配置（數據增強策略）
-RFID_MASK_ENABLED = False         # 是否啟用 RFID 遮罩處理（已關閉）
+RFID_MASK_ENABLED = True         # 是否啟用 RFID 遮罩處理（已開啟）
 RFID_MASK_MODE = "noise"          # 填充模式: "noise" (隨機噪點) 或 "mean" (平均灰階值)
 RFID_NOISE_INTENSITY = 0.3        # 隨機噪點強度 (0.0-1.0)，僅在 mode="noise" 時使用
 
 # 資料擴增配置
 AUGMENTATION_ENABLED = True  # 是否啟用資料擴增（已開啟）
 AUGMENTATION_TRANSLATE_PERCENT = 0.15  # 平移範圍：±5% 圖像尺寸
-AUGMENTATION_SCALE_MIN = 0.9  # 縮放範圍最小值：90%
-AUGMENTATION_SCALE_MAX = 1.5  # 縮放範圍最大值：110%
-AUGMENTATION_ROTATE_DEGREES = 90  # 旋轉角度範圍：±15度
-AUGMENTATION_CONTRAST_MIN = 0.8  # 對比度範圍最小值：80%（降低對比度）
-AUGMENTATION_CONTRAST_MAX = 1.2  # 對比度範圍最大值：120%（增強對比度）
+AUGMENTATION_SCALE_MIN = 0.7  # 縮放範圍最小值：90%
+AUGMENTATION_SCALE_MAX = 1.3  # 縮放範圍最大值：110%
+AUGMENTATION_ROTATE_DEGREES = 180  # 旋轉角度範圍：±15度
+
+# 圓形檢測配置
+CIRCLE_MASK_MARGIN = 35  # 圓形遮罩邊緣容差（像素），增加以保留邊緣 colony，避免過度裁剪
+BINARY_MASK_MARGIN = 20  # 第二次二值化遮罩邊緣容差（像素），避免邊緣 colony 被切除
 
 
 # ============================================================================
@@ -103,9 +105,7 @@ class FasterRCNNDataset(Dataset):
         translate_percent: float = AUGMENTATION_TRANSLATE_PERCENT,
         scale_min: float = AUGMENTATION_SCALE_MIN,
         scale_max: float = AUGMENTATION_SCALE_MAX,
-        rotate_degrees: float = AUGMENTATION_ROTATE_DEGREES,
-        contrast_min: float = AUGMENTATION_CONTRAST_MIN,
-        contrast_max: float = AUGMENTATION_CONTRAST_MAX
+        rotate_degrees: float = AUGMENTATION_ROTATE_DEGREES
     ):
         """
         初始化數據集
@@ -120,8 +120,6 @@ class FasterRCNNDataset(Dataset):
             scale_min: 縮放範圍最小值（預設 0.9 = 90%）
             scale_max: 縮放範圍最大值（預設 1.1 = 110%）
             rotate_degrees: 旋轉角度範圍（預設 15 = ±15度）
-            contrast_min: 對比度範圍最小值（預設 0.8 = 80%）
-            contrast_max: 對比度範圍最大值（預設 1.2 = 120%）
         """
         self.image_dir = Path(image_dir)
         if not self.image_dir.exists():
@@ -135,8 +133,6 @@ class FasterRCNNDataset(Dataset):
         self.scale_min = scale_min
         self.scale_max = scale_max
         self.rotate_degrees = rotate_degrees
-        self.contrast_min = contrast_min
-        self.contrast_max = contrast_max
         
         # 圖像轉換（Faster R-CNN 需要 tensor 格式）
         self.transform = transform or transforms.Compose([
@@ -544,18 +540,30 @@ class FasterRCNNDataset(Dataset):
     #     return enhanced, crop_offset
     
     @staticmethod
-    def _detect_petri_dish_circle(img: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    def _detect_petri_dish_circle(img: np.ndarray, image_path: Optional[Path] = None) -> Optional[Tuple[int, int, int]]:
         """
         使用 HoughCircles 或 Otsu + 輪廓檢測來定位培養皿的圓形區域
         
         Args:
             img: 原始圖像（BGR 格式）
+            image_path: 圖像檔案路徑（可選，用於保存第一次二值化結果）
             
         Returns:
             (center_x, center_y, radius) 元組，如果找不到則返回 None
         """
         # 轉換為灰階
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 進行第一次二值化（無論使用哪種方法檢測圓形，都先進行二值化）
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # 保存第一次二值化結果到 threshold 資料夾
+        if image_path is not None:
+            threshold_dir = Path("threshold")
+            threshold_dir.mkdir(parents=True, exist_ok=True)
+            threshold_file = threshold_dir / image_path.name
+            cv2.imwrite(str(threshold_file), binary)
+            logger.debug(f"已保存第一次二值化結果: {threshold_file}")
         
         # 方法1: 嘗試使用 HoughCircles 檢測圓形
         # 使用高斯模糊減少噪點
@@ -583,9 +591,6 @@ class FasterRCNNDataset(Dataset):
         
         # 方法2: 如果 HoughCircles 失敗，使用 Otsu + 輪廓檢測
         logger.debug("HoughCircles 未檢測到圓形，嘗試使用 Otsu + 輪廓檢測")
-        
-        # Otsu 二值化
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
         # 形態學操作：去除小噪點，填充空洞
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -810,8 +815,8 @@ class FasterRCNNDataset(Dataset):
         # 1. 轉換為灰階
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # 2. 檢測培養皿圓形區域
-        circle_info = FasterRCNNDataset._detect_petri_dish_circle(img)
+        # 2. 檢測培養皿圓形區域（傳入 image_path 以便保存第一次二值化結果）
+        circle_info = FasterRCNNDataset._detect_petri_dish_circle(img, image_path=image_path)
         
         if circle_info is None:
             logger.warning(f"無法檢測到培養皿圓形區域，返回原圖: {image_path}")
@@ -829,8 +834,10 @@ class FasterRCNNDataset(Dataset):
         center_x, center_y, radius = circle_info
         
         # 3. 建立遮罩：圓形區域為白色(255)，背景為黑色(0)
+        # 增加邊緣容差，確保邊緣 colony 不被排除
+        expanded_radius = radius + CIRCLE_MASK_MARGIN
         mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.circle(mask, (center_x, center_y), radius, 255, -1)  # 填充圓形
+        cv2.circle(mask, (center_x, center_y), int(expanded_radius), 255, -1)  # 填充圓形（帶邊緣容差）
         
         # 4. 將圓形區域以外的背景填滿純黑色
         masked_gray = gray.copy()
@@ -845,6 +852,43 @@ class FasterRCNNDataset(Dataset):
         
         # 只保留圓形區域內的 CLAHE 結果，圓形區域外保持黑色
         masked_gray[mask > 0] = clahe_result[mask > 0]
+        
+        # 5.5. 第二次二值化：在圓形區域內進行物件分割的二值化
+        # 建立更寬鬆的二值化處理遮罩（擴大邊緣容差，避免邊緣 colony 被切除）
+        binary_mask_radius = radius + CIRCLE_MASK_MARGIN + BINARY_MASK_MARGIN
+        binary_mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.circle(binary_mask, (center_x, center_y), int(binary_mask_radius), 255, -1)  # 更大的處理範圍
+        
+        # 提取擴大的圓形區域內的圖像進行二值化
+        circle_region = masked_gray.copy()
+        circle_region[binary_mask == 0] = 0  # 使用擴大的遮罩範圍
+        
+        # 進行第二次二值化（用於物件分割）
+        if BINARY_USE_OTSU:
+            _, binary2 = cv2.threshold(circle_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        else:
+            _, binary2 = cv2.threshold(circle_region, BINARY_OBJECTS_THRESHOLD, 255, cv2.THRESH_BINARY)
+        
+        # 形態學操作：去除小噪點
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary2 = cv2.morphologyEx(binary2, cv2.MORPH_OPEN, kernel)
+        
+        # 保存第二次二值化結果到 threshold2 資料夾
+        threshold2_dir = Path("threshold2")
+        threshold2_dir.mkdir(parents=True, exist_ok=True)
+        threshold2_file = threshold2_dir / image_path.name
+        cv2.imwrite(str(threshold2_file), binary2)
+        logger.debug(f"已保存第二次二值化結果: {threshold2_file}")
+        
+        # 5.6. 將第二次二值化結果作為遮罩應用到 masked_gray
+        # 只在原始圓形遮罩範圍內應用二值化遮罩，保留邊緣區域
+        # 這樣可以避免邊緣 colony 被過度切除，同時讓模型學習二值化檢測到的物件特徵
+        # 只在 mask（原始圓形區域）內應用二值化遮罩，邊緣區域保留
+        mask_region = (mask > 0)  # 原始圓形區域
+        binary2_region = (binary2 > 0)  # 二值化檢測到的物件區域
+        # 在原始圓形區域內，將非物件區域設為黑色；圓形區域外保持原樣（已設為黑色）
+        masked_gray[mask_region & ~binary2_region] = 0  # 只在圓形區域內且非物件區域設為黑色
+        logger.debug(f"已應用第二次二值化遮罩（保留邊緣，容差={CIRCLE_MASK_MARGIN}+{BINARY_MASK_MARGIN}像素），模型將學習二值化檢測到的物件區域")
         
         # 6. 應用 RFID 遮罩（數據增強策略，如果啟用）
         if RFID_MASK_ENABLED and annotations is not None and category_names is not None:
@@ -870,12 +914,10 @@ class FasterRCNNDataset(Dataset):
         translate_percent: float,
         scale_min: float,
         scale_max: float,
-        rotate_degrees: float,
-        contrast_min: float = 1.0,
-        contrast_max: float = 1.0
+        rotate_degrees: float
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        對圖像和邊界框應用資料擴增（平移、縮放、旋轉、對比度）
+        對圖像和邊界框應用資料擴增（平移、縮放、旋轉）
         
         Args:
             image: 圖像陣列 [H, W, C] (RGB)
@@ -884,8 +926,6 @@ class FasterRCNNDataset(Dataset):
             scale_min: 縮放範圍最小值
             scale_max: 縮放範圍最大值
             rotate_degrees: 旋轉角度範圍（度）
-            contrast_min: 對比度範圍最小值（1.0 = 無變化，< 1.0 = 降低對比度）
-            contrast_max: 對比度範圍最大值（1.0 = 無變化，> 1.0 = 增強對比度）
             
         Returns:
             (augmented_image, augmented_boxes) 元組
@@ -980,14 +1020,6 @@ class FasterRCNNDataset(Dataset):
                         rotated_boxes.append([new_x_min, new_y_min, new_x_max, new_y_max])
                 
                 augmented_boxes = np.array(rotated_boxes, dtype=np.float32)
-        
-        # 4. 對比度調整（不影響邊界框座標）
-        if contrast_max > contrast_min:
-            contrast_alpha = np.random.uniform(contrast_min, contrast_max)
-            # 使用 cv2.convertScaleAbs 進行對比度調整
-            # alpha 控制對比度：1.0 = 無變化，> 1.0 = 增強，< 1.0 = 降低
-            # beta 控制亮度：0 = 不改變亮度
-            augmented_image = cv2.convertScaleAbs(augmented_image, alpha=contrast_alpha, beta=0)
         
         # 確保邊界框在圖像範圍內
         if len(augmented_boxes) > 0:
@@ -1092,9 +1124,7 @@ class FasterRCNNDataset(Dataset):
                 self.translate_percent,
                 self.scale_min,
                 self.scale_max,
-                self.rotate_degrees,
-                self.contrast_min,
-                self.contrast_max
+                self.rotate_degrees
             )
             # 更新 labels_list（過濾掉無效的邊界框對應的標籤）
             if len(boxes_array) < len(labels_list):

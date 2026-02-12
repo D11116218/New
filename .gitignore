@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model outputs and training results
+run/
+*.pth
+*.pt
+*.ckpt
+
+# Preprocessing outputs (optional - uncomment if you don't want to track these)
+# threshold/
+# threshold2/
+# grayscale/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files (large files, uncomment if needed)
+# *.h5
+# *.hdf5

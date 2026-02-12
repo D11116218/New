@@ -55,7 +55,7 @@ class DetectionConfig:
     #   - 建議根據實際偵測結果逐步調整
     CATEGORY_THRESHOLDS = {
         'RFID': 0.69,      # 提高閾值以減少誤報
-        'colony': 0.395,   # 進一步降低以偵測更多 colony
+        'colony': 0.1,   # 進一步降低以偵測更多 colony
         'point': 0.01    # 降低從 0.05 到 0.03，偵測更多 point
     }
     # NMS（非極大值抑制）閾值配置(越高越寬鬆)
@@ -80,9 +80,9 @@ class DetectionConfig:
     BINARY_USE_OTSU = True            # 是否使用 Otsu 自動閾值進行物件分割
     
     # RFID 遮罩配置(數據增強策略，推理時通常不需要，但保留以保持與 model.py 一致)
-    RFID_MASK_ENABLED = False          # 是否啟用 RFID 遮罩處理（與 model.py 保持一致，已關閉）
+    RFID_MASK_ENABLED = True          # 是否啟用 RFID 遮罩處理（與 model.py 保持一致，已開啟）
     RFID_MASK_MODE = "noise"           # 填充模式: "noise" (隨機噪點) 或 "mean" (平均灰階值)
-    RFID_NOISE_INTENSITY = 0.3         # 隨機噪點強度 (0.0-1.0)，僅在 mode="noise" 時使用
+    RFID_NOISE_INTENSITY = 0.5         # 隨機噪點強度 (0.0-1.0)，僅在 mode="noise" 時使用
     
     # 繪圖配置
     DRAW_SHOW_SCORES = True            # 是否顯示信心值分數
