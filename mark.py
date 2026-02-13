@@ -21,7 +21,7 @@ from torch.amp import autocast
 from torchvision import transforms
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.ops import box_iou
+from torchvision.ops import box_iou, nms
 
 # 檢查 torchvision weights API 可用性
 USE_WEIGHTS_API, FasterRCNN_ResNet50_FPN_Weights = get_torchvision_weights_api()
@@ -38,42 +38,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class DetectionConfig:
-    
-    
     # 基本配置
     DEFAULT_NUM_CLASSES = 4
     IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp']
     
     # 類別特定閾值
-    # 調整建議：
-    #   - 降低閾值可以偵測到更多物體，但可能增加誤報
-    #   - 提高閾值可以減少誤報，但可能漏掉一些真實物體
-    #   - 建議根據實際偵測結果逐步調整
     CATEGORY_THRESHOLDS = {
-        'RFID': 0.69,      # 提高閾值以減少誤報
-        'colony': 0.3,    # 提高閾值以減少誤報
-        'point': 0.35    # 降低從 0.05 到 0.03，偵測更多 point
+        'RFID': 0.5,
+        'colony': 0.18,
+        'point': 0.2
     }
     
-    # 預處理配置(與 model.py 保持一致)
+    # 預處理配置（與 model.py 保持一致）
     PREPROCESS_DENOISE_STRENGTH = 10  # 降噪強度
     PREPROCESS_SHARPEN_RADIUS = 5    # 銳化半徑
     PREPROCESS_CONTRAST_ALPHA = 1.0   # 對比度增強係數
     
-    # 二值化配置(與 model.py 保持一致)
-    BINARY_PETRI_DISH_THRESHOLD = 30  # 培養皿與背景分割的閾值(黑色背景 < 30)
-    BINARY_OBJECTS_THRESHOLD = 127    # 物件分割的閾值(Otsu 自動閾值或固定閾值)
-    BINARY_USE_OTSU = True            # 是否使用 Otsu 自動閾值進行物件分割
+    # 同類別 NMS 配置(數值越高越不積極)
+    SAME_CLASS_NMS_ENABLED = True
+    SAME_CLASS_NMS_IOU_THRESHOLD = 0.1
     
-    # RFID 遮罩配置(數據增強策略，推理時通常不需要，但保留以保持與 model.py 一致)
-    RFID_MASK_ENABLED = True          # 是否啟用 RFID 遮罩處理（與 model.py 保持一致，已開啟）
-    RFID_MASK_MODE = "noise"           # 填充模式: "noise" (隨機噪點) 或 "mean" (平均灰階值)
-    RFID_NOISE_INTENSITY = 0.5         # 隨機噪點強度 (0.0-1.0)，僅在 mode="noise" 時使用
+    # 跨類別 NMS 配置
+    CROSS_CLASS_NMS_ENABLED = True
+    CROSS_CLASS_NMS_IOU_THRESHOLD = 0.1
     
     # 繪圖配置
-    DRAW_SHOW_SCORES = True            # 是否顯示信心值分數
-    DRAW_LINE_WIDTH = 2                # 邊界框線寬
-    DRAW_FONT_SIZE = 16                # 字體大小
+    DRAW_SHOW_SCORES = True
+    DRAW_LINE_WIDTH = 2
+    DRAW_FONT_SIZE = 16
     DRAW_CATEGORY_COLORS = {
         'RFID': (170, 255, 255),       # 淺青色
         'colony': (255, 255, 170),    # 淺黃色
@@ -87,19 +79,11 @@ class DetectionConfig:
         (255, 0, 255),  # 洋紅色
         (0, 255, 255),  # 青色
     ]
+
 # 向後兼容：保留舊的常數名稱
 DEFAULT_NUM_CLASSES = DetectionConfig.DEFAULT_NUM_CLASSES
 CATEGORY_THRESHOLDS = DetectionConfig.CATEGORY_THRESHOLDS
 IMAGE_EXTENSIONS = DetectionConfig.IMAGE_EXTENSIONS
-PREPROCESS_DENOISE_STRENGTH = DetectionConfig.PREPROCESS_DENOISE_STRENGTH
-PREPROCESS_SHARPEN_RADIUS = DetectionConfig.PREPROCESS_SHARPEN_RADIUS
-PREPROCESS_CONTRAST_ALPHA = DetectionConfig.PREPROCESS_CONTRAST_ALPHA
-BINARY_PETRI_DISH_THRESHOLD = DetectionConfig.BINARY_PETRI_DISH_THRESHOLD
-BINARY_OBJECTS_THRESHOLD = DetectionConfig.BINARY_OBJECTS_THRESHOLD
-BINARY_USE_OTSU = DetectionConfig.BINARY_USE_OTSU
-RFID_MASK_ENABLED = DetectionConfig.RFID_MASK_ENABLED
-RFID_MASK_MODE = DetectionConfig.RFID_MASK_MODE
-RFID_NOISE_INTENSITY = DetectionConfig.RFID_NOISE_INTENSITY
 
 # ============================================================================
 # 偵測器類別
@@ -113,8 +97,7 @@ class FasterRCNNDetector:
         num_classes: int = DEFAULT_NUM_CLASSES,
         device: Optional[str] = None
     ):
-    
-        
+            
         self.num_classes = num_classes
         
         # 設置設備
@@ -135,8 +118,6 @@ class FasterRCNNDetector:
             logger.info(f"GPU 設備: {gpu_name}")
             logger.info(f"GPU 記憶體: {gpu_memory:.2f} GB")
             logger.info("已啟用 CUDNN benchmark 和 TF32 加速")
-        
-        logger.info(f"使用設備: {self.device}")
         
         # 載入模型
         if model_path is None:
@@ -256,9 +237,8 @@ class FasterRCNNDetector:
                 for cat in annotations_data.get('categories', []):
                     cat_id = cat.get('id')
                     cat_name = cat.get('name')
-                    if cat_id is not None and cat_name:
+                    if cat_id is not None and cat_name is not None:
                         category_names[cat_id] = cat_name
-                        logger.info(f"載入類別: {cat_id} -> {cat_name}")
                 
             except Exception as e:
                 logger.warning(f"無法從 {train_annotation_file} 載入類別資訊: {e}")
@@ -272,500 +252,68 @@ class FasterRCNNDetector:
         return category_names
     
     @staticmethod
-    def _binary_segment_petri_dish(img: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
+    def _preprocess_image(
+        img: np.ndarray
+    ) -> Tuple[np.ndarray, Tuple[int, int]]:
+        """
+        預處理流程（與 model.py 保持一致）：
+        1. 轉灰階（第一步）
+        2. 銳利化
+        3. 降低雜訊
+        4. 對比度增強（CLAHE）
         
-        # 轉換為灰階
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # 二值化：黑色背景 < BINARY_PETRI_DISH_THRESHOLD，培養皿區域 >= BINARY_PETRI_DISH_THRESHOLD
-        _, binary = cv2.threshold(gray, BINARY_PETRI_DISH_THRESHOLD, 255, cv2.THRESH_BINARY)
-        
-        # 形態學操作：去除小噪點，填充空洞
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        
-        # 尋找最大連通區域（培養皿）
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-        
-        if num_labels < 2:
-            # 如果找不到培養皿，返回原圖
-            logger.warning("無法找到培養皿區域，返回原圖")
-            return img, (0, 0)
-        
-        # 找出面積最大的連通區域（排除背景，索引 0）
-        max_area_idx = 1
-        max_area = stats[1, cv2.CC_STAT_AREA]
-        for i in range(2, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if area > max_area:
-                max_area = area
-                max_area_idx = i
-        
-        # 獲取培養皿的邊界框
-        x = stats[max_area_idx, cv2.CC_STAT_LEFT]
-        y = stats[max_area_idx, cv2.CC_STAT_TOP]
-        w = stats[max_area_idx, cv2.CC_STAT_WIDTH]
-        h = stats[max_area_idx, cv2.CC_STAT_HEIGHT]
-        
-        # 添加一些邊距（避免裁剪過緊）
-        margin = 10
-        x = max(0, x - margin)
-        y = max(0, y - margin)
-        w = min(img.shape[1] - x, w + 2 * margin)
-        h = min(img.shape[0] - y, h + 2 * margin)
-        
-        # 裁剪培養皿區域
-        petri_dish_region = img[y:y+h, x:x+w]
-        
-        return petri_dish_region, (x, y)
-    
-    @staticmethod
-    def _binary_segment_objects(img: np.ndarray) -> np.ndarray:
-        
-        # 轉換為灰階
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # 二值化分割物件
-        if BINARY_USE_OTSU:
-            # 使用 Otsu 自動閾值
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        else:
-            # 使用固定閾值
-            _, binary = cv2.threshold(gray, BINARY_OBJECTS_THRESHOLD, 255, cv2.THRESH_BINARY)
-        
-        # 形態學操作：去除小噪點
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        
-        return binary
-    
-    @staticmethod
-    def _detect_petri_dish_circle(img: np.ndarray) -> Optional[Tuple[int, int, int]]:
-        
-        # 轉換為灰階
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        # 方法1: 嘗試使用 HoughCircles 檢測圓形
-        # 使用高斯模糊減少噪點
-        blurred = cv2.GaussianBlur(gray, (9, 9), 2)
-        
-        # HoughCircles 參數
-        circles = cv2.HoughCircles(
-            blurred,
-            cv2.HOUGH_GRADIENT,
-            dp=1,
-            minDist=int(min(img.shape[:2]) * 0.5),  # 最小圓心距離
-            param1=50,   # Canny 邊緣檢測的高閾值
-            param2=30,   # 累積器閾值
-            minRadius=int(min(img.shape[:2]) * 0.2),  # 最小半徑
-            maxRadius=int(min(img.shape[:2]) * 0.45)  # 最大半徑
-        )
-        
-        if circles is not None:
-            circles = np.uint16(np.around(circles))
-            # 選擇半徑最大的圓（通常是培養皿）
-            best_circle = circles[0][np.argmax(circles[0][:, 2])]
-            center_x, center_y, radius = int(best_circle[0]), int(best_circle[1]), int(best_circle[2])
-            logger.debug(f"使用 HoughCircles 檢測到圓形: center=({center_x}, {center_y}), radius={radius}")
-            return (center_x, center_y, radius)
-        
-        # 方法2: 如果 HoughCircles 失敗，使用 Otsu + 輪廓檢測
-        logger.debug("HoughCircles 未檢測到圓形，嘗試使用 Otsu + 輪廓檢測")
-        
-        # Otsu 二值化
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # 形態學操作：去除小噪點，填充空洞
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        
-        # 尋找輪廓
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            logger.warning("無法找到培養皿輪廓")
-            return None
-        
-        # 找出面積最大的輪廓（通常是培養皿）
-        largest_contour = max(contours, key=cv2.contourArea)
-        
-        # 使用最小外接圓來近似培養皿
-        (center_x, center_y), radius = cv2.minEnclosingCircle(largest_contour)
-        center_x, center_y, radius = int(center_x), int(center_y), int(radius)
-        
-        logger.debug(f"使用輪廓檢測到圓形: center=({center_x}, {center_y}), radius={radius}")
-        return (center_x, center_y, radius)
-    
-    @staticmethod
-    def _get_rfid_bboxes_from_annotations(
-        annotations: List[Dict],
-        category_names: Optional[Dict[int, str]] = None
-    ) -> List[np.ndarray]:
-        
-        rfid_bboxes = []
-        
-        # 找出 RFID 的 category_id（如果提供了 category_names）
-        rfid_category_id = None
-        if category_names is not None:
-            for cat_id, cat_name in category_names.items():
-                if cat_name == 'RFID':
-                    rfid_category_id = cat_id
-                    break
-        
-        # 轉換所有 RFID 標註的 bbox
-        for ann in annotations:
-            # 檢查是否為 RFID 標註
-            is_rfid = False
-            
-            # 方法1: 通過 category_id 檢查（JSON/COCO 格式）
-            if rfid_category_id is not None and ann.get('category_id') == rfid_category_id:
-                is_rfid = True
-            # 方法2: 直接檢查 category_name（XML 格式或包含 category_name 的格式）
-            elif ann.get('category_name', '').lower() == 'rfid':
-                is_rfid = True
-            
-            if not is_rfid:
-                continue
-            
-            # 轉換 COCO 格式 [x, y, w, h] 到 [x_min, y_min, x_max, y_max]
-            bbox_coco = ann['bbox']
-            x_min = bbox_coco[0]
-            y_min = bbox_coco[1]
-            x_max = x_min + bbox_coco[2]
-            y_max = y_min + bbox_coco[3]
-            rfid_bboxes.append(np.array([x_min, y_min, x_max, y_max], dtype=np.float32))
-        
-        return rfid_bboxes
-    
-    @staticmethod
-    def _apply_rfid_mask(
-        image: np.ndarray,
-        rfid_bboxes: List[np.ndarray],
-        mode: str = "noise",
-        noise_intensity: float = 0.3
-    ) -> np.ndarray:
-        
-        if len(rfid_bboxes) == 0:
-            return image
-        
-        result = image.copy()
-        h, w = image.shape[:2]
-        
-        for bbox in rfid_bboxes:
-            x_min, y_min, x_max, y_max = bbox.astype(int)
-            
-            # 確保座標在圖像範圍內
-            x_min = max(0, min(w, x_min))
-            y_min = max(0, min(h, y_min))
-            x_max = max(0, min(w, x_max))
-            y_max = max(0, min(h, y_max))
-            
-            if x_max <= x_min or y_max <= y_min:
-                continue
-            
-            # 提取 RFID 區域
-            rfid_region = result[y_min:y_max, x_min:x_max]
-            
-            if mode == "mean":
-                # 使用該區域的平均灰階值填充
-                mean_value = np.mean(rfid_region).astype(np.uint8)
-                result[y_min:y_max, x_min:x_max] = mean_value
-            elif mode == "noise":
-                # 使用隨機噪點填充
-                # 生成與原區域相同尺寸的隨機噪點
-                noise = np.random.randint(0, 256, size=rfid_region.shape, dtype=np.uint8)
-                # 混合原圖和噪點
-                result[y_min:y_max, x_min:x_max] = (
-                    rfid_region.astype(np.float32) * (1 - noise_intensity) +
-                    noise.astype(np.float32) * noise_intensity
-                ).astype(np.uint8)
-            else:
-                logger.warning(f"未知的 RFID 遮罩模式: {mode}，跳過處理")
-        
-        return result
-    
-    @staticmethod
-    def _new_preprocess_with_circle_detection(
-        img: np.ndarray,
-        annotations: Optional[List[Dict]] = None,
-        category_names: Optional[Dict[int, str]] = None
-    ) -> np.ndarray:
-        
+        注意：保持影像尺寸不變，不進行裁剪以避免標註座標偏移
+        """
         original_shape = img.shape[:2]  # 保存原始尺寸 (H, W)
         
-        # 1. 轉換為灰階
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # 1. 轉換為灰階（第一步，確保無論輸入格式如何都轉為灰階）
+        if len(img.shape) == 3:
+            # 如果是彩色圖像（BGR 或 RGB），轉換為灰階
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        elif len(img.shape) == 2:
+            # 如果已經是灰階圖像，直接使用
+            gray = img.copy()
+        else:
+            raise ValueError(f"不支援的圖像格式: shape={img.shape}")
         
-        # 2. 檢測培養皿圓形區域
-        circle_info = FasterRCNNDetector._detect_petri_dish_circle(img)
+        # 2. 銳利化
+        # 使用 Unsharp Masking 方法：銳化圖 = 原圖 + (原圖 - 模糊圖) * 強度
+        # 計算高斯模糊的核大小（必須是奇數）
+        kernel_size = int(DetectionConfig.PREPROCESS_SHARPEN_RADIUS * 2 + 1)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        blurred = cv2.GaussianBlur(gray, (kernel_size, kernel_size), DetectionConfig.PREPROCESS_SHARPEN_RADIUS)
+        # Unsharp Masking：原圖 + (原圖 - 模糊圖)
+        sharpened = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+        # 確保值在有效範圍內
+        sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
         
-        if circle_info is None:
-            logger.warning("無法檢測到培養皿圓形區域，返回原圖")
-            # 即使沒有圓形區域，仍然可以應用 RFID 遮罩（如果啟用）
-            if RFID_MASK_ENABLED and annotations is not None and category_names is not None:
-                rfid_bboxes = FasterRCNNDetector._get_rfid_bboxes_from_annotations(
-                    annotations, category_names
-                )
-                if len(rfid_bboxes) > 0:
-                    gray = FasterRCNNDetector._apply_rfid_mask(
-                        gray, rfid_bboxes, RFID_MASK_MODE, RFID_NOISE_INTENSITY
-                    )
-            return gray
+        # 3. 降低雜訊
+        # 使用 Non-local Means Denoising（對灰階圖像）
+        denoised = cv2.fastNlMeansDenoising(
+            sharpened,
+            h=DetectionConfig.PREPROCESS_DENOISE_STRENGTH,  # 降噪強度參數
+            templateWindowSize=7,
+            searchWindowSize=21
+        )
         
-        center_x, center_y, radius = circle_info
-        
-        # 3. 建立遮罩：圓形區域為白色(255)，背景為黑色(0)
-        mask = np.zeros(gray.shape, dtype=np.uint8)
-        cv2.circle(mask, (center_x, center_y), radius, 255, -1)  # 填充圓形
-        
-        # 4. 將圓形區域以外的背景填滿純黑色
-        masked_gray = gray.copy()
-        masked_gray[mask == 0] = 0  # 圓形區域外設為黑色
-        
-        # 5. 對圓形區域內部進行 CLAHE（自適應直方圖均衡化）
-        # 創建 CLAHE 對象
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        
-        # 對整個圖像應用 CLAHE（但只保留圓形區域內的部分）
-        clahe_result = clahe.apply(masked_gray)
-        
-        # 只保留圓形區域內的 CLAHE 結果，圓形區域外保持黑色
-        masked_gray[mask > 0] = clahe_result[mask > 0]
-        
-        # 6. 應用 RFID 遮罩（數據增強策略，如果啟用）
-        if RFID_MASK_ENABLED and annotations is not None and category_names is not None:
-            rfid_bboxes = FasterRCNNDetector._get_rfid_bboxes_from_annotations(
-                annotations, category_names
-            )
-            if len(rfid_bboxes) > 0:
-                masked_gray = FasterRCNNDetector._apply_rfid_mask(
-                    masked_gray, rfid_bboxes, RFID_MASK_MODE, RFID_NOISE_INTENSITY
-                )
-                logger.debug(f"已應用 RFID 遮罩: {len(rfid_bboxes)} 個 RFID 區域")
+        # 4. 對比度增強
+        # 使用 CLAHE（自適應直方圖均衡化）進行對比度增強
+        clahe = cv2.createCLAHE(
+            clipLimit=DetectionConfig.PREPROCESS_CONTRAST_ALPHA * 2.0,  # 對比度增強係數
+            tileGridSize=(8, 8)
+        )
+        contrast_enhanced = clahe.apply(denoised)
         
         # 確保影像尺寸不變
-        assert masked_gray.shape == original_shape, \
-            f"影像尺寸改變: 原始={original_shape}, 處理後={masked_gray.shape}"
-        
-        return masked_gray
-    
-    @staticmethod
-    def _preprocess_image(
-        img: np.ndarray,
-        annotations: Optional[List[Dict]] = None,
-        category_names: Optional[Dict[int, str]] = None
-    ) -> Tuple[np.ndarray, Tuple[int, int]]:
-        
-        # 使用新的預處理方法（圓形檢測 + CLAHE）
-        processed_gray = FasterRCNNDetector._new_preprocess_with_circle_detection(
-            img, annotations=annotations, category_names=category_names
-        )
+        assert contrast_enhanced.shape == original_shape, \
+            f"影像尺寸改變: 原始={original_shape}, 處理後={contrast_enhanced.shape}"
         
         # 轉換為 RGB 格式（PIL Image 需要）
-        # 將單通道灰階圖像複製為 3 通道 RGB
-        processed_rgb = cv2.cvtColor(processed_gray, cv2.COLOR_GRAY2RGB)
+        processed_rgb = cv2.cvtColor(contrast_enhanced, cv2.COLOR_GRAY2RGB)
         
-        # 因為保持影像尺寸不變，所以 crop_offset 為 (0, 0)
+        # 保持影像尺寸不變，所以 crop_offset 為 (0, 0)
         return processed_rgb, (0, 0)
-    
-    @staticmethod
-    def _check_box_inside_rfid(box: torch.Tensor, rfid_boxes: torch.Tensor) -> bool:
-        
-        if len(rfid_boxes) == 0:
-            return False
-        
-        # 計算框的中心點
-        box_center_x = (box[0] + box[2]) / 2
-        box_center_y = (box[1] + box[3]) / 2
-        
-        # 檢查中心點是否在任何 RFID 框內
-        center_inside = (
-            (box_center_x >= rfid_boxes[:, 0]) & 
-            (box_center_x <= rfid_boxes[:, 2]) &
-            (box_center_y >= rfid_boxes[:, 1]) & 
-            (box_center_y <= rfid_boxes[:, 3])
-        )
-        return center_inside.any().item()
-    
-    @staticmethod
-    def _check_box_inside_colony(box: torch.Tensor, colony_boxes: torch.Tensor) -> bool:
-        
-        if len(colony_boxes) == 0:
-            return False
-        
-        # 計算框的中心點
-        box_center_x = (box[0] + box[2]) / 2
-        box_center_y = (box[1] + box[3]) / 2
-        
-        # 檢查中心點是否在任何 colony 框內
-        center_inside = (
-            (box_center_x >= colony_boxes[:, 0]) & 
-            (box_center_x <= colony_boxes[:, 2]) &
-            (box_center_y >= colony_boxes[:, 1]) & 
-            (box_center_y <= colony_boxes[:, 3])
-        )
-        return center_inside.any().item()
-    
-    @staticmethod
-    def _calculate_box_area(box: torch.Tensor) -> float:
-        """計算邊界框的面積"""
-        width = box[2] - box[0]
-        height = box[3] - box[1]
-        return width * height
-    
-    @staticmethod
-    def _calculate_overlap_ratio(box1: torch.Tensor, box2: torch.Tensor) -> float:
-        """計算兩個框的重疊面積相對於較小框的面積比例"""
-        # 計算交集區域
-        x1_min, y1_min, x1_max, y1_max = box1
-        x2_min, y2_min, x2_max, y2_max = box2
-        
-        # 交集區域
-        inter_x_min = torch.max(x1_min, x2_min)
-        inter_y_min = torch.max(y1_min, y2_min)
-        inter_x_max = torch.min(x1_max, x2_max)
-        inter_y_max = torch.min(y1_max, y2_max)
-        
-        # 如果沒有交集，返回0
-        if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
-            return 0.0
-        
-        # 交集面積
-        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
-        
-        # 計算兩個框的面積
-        area1 = FasterRCNNDetector._calculate_box_area(box1)
-        area2 = FasterRCNNDetector._calculate_box_area(box2)
-        
-        # 重疊面積相對於較小框的比例
-        min_area = min(area1, area2)
-        if min_area == 0:
-            return 0.0
-        
-        overlap_ratio = inter_area / min_area
-        return overlap_ratio
-    
-    def _analyze_box_color_features(
-        self,
-        box: torch.Tensor,
-        original_image: np.ndarray
-    ) -> Dict[str, float]:
-        
-        x1, y1, x2, y2 = box.cpu().numpy().astype(int)
-        h, w = original_image.shape[:2]
-        
-        # 確保座標在圖像範圍內
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(x1 + 1, min(x2, w))
-        y2 = max(y1 + 1, min(y2, h))
-        
-        if x2 <= x1 or y2 <= y1:
-            return {'center_darkness': 0.5, 'edge_darkness': 0.5, 'solidity_ratio': 1.0}
-        
-        # 提取邊界框區域
-        box_region = original_image[y1:y2, x1:x2]
-        
-        # 轉換為灰階（如果原本是 RGB）
-        if len(box_region.shape) == 3:
-            gray_region = cv2.cvtColor(box_region, cv2.COLOR_RGB2GRAY)
-        else:
-            gray_region = box_region
-        
-        # 計算中心區域（取中間 50% 的區域）
-        center_x1 = int((x2 - x1) * 0.25)
-        center_y1 = int((y2 - y1) * 0.25)
-        center_x2 = int((x2 - x1) * 0.75)
-        center_y2 = int((y2 - y1) * 0.75)
-        
-        center_region = gray_region[center_y1:center_y2, center_x1:center_x2]
-        
-        # 計算邊緣區域（外圍 25% 的區域）
-        edge_mask = np.ones_like(gray_region, dtype=bool)
-        edge_mask[center_y1:center_y2, center_x1:center_x2] = False
-        edge_region = gray_region[edge_mask]
-        
-        # 計算平均暗度（0-255 轉換為 0-1，值越小越暗）
-        center_mean = center_region.mean() if center_region.size > 0 else 128
-        edge_mean = edge_region.mean() if edge_region.size > 0 else 128
-        
-        # 轉換為暗度（0-1，1 表示最暗）
-        center_darkness = 1.0 - (center_mean / 255.0)
-        edge_darkness = 1.0 - (edge_mean / 255.0)
-        
-        # 計算實心度比例（>1 表示中心比邊緣暗，即實心）
-        if edge_darkness > 0.01:  # 避免除零
-            solidity_ratio = center_darkness / edge_darkness
-        else:
-            solidity_ratio = 1.0
-        
-        return {
-            'center_darkness': center_darkness,
-            'edge_darkness': edge_darkness,
-            'solidity_ratio': solidity_ratio
-        }
-    
-    def _is_text_region(
-        self,
-        box: torch.Tensor,
-        original_image: np.ndarray
-    ) -> bool:
-        """
-        檢測邊界框區域是否為文字區域
-        文字特徵：高對比度、邊緣密集、矩形形狀明顯
-        """
-        x1, y1, x2, y2 = box.cpu().numpy().astype(int)
-        h, w = original_image.shape[:2]
-        
-        # 確保座標在圖像範圍內
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(x1 + 1, min(x2, w))
-        y2 = max(y1 + 1, min(y2, h))
-        
-        if x2 <= x1 or y2 <= y1:
-            return False
-        
-        # 提取邊界框區域
-        box_region = original_image[y1:y2, x1:x2]
-        
-        # 轉換為灰階
-        if len(box_region.shape) == 3:
-            gray_region = cv2.cvtColor(box_region, cv2.COLOR_RGB2GRAY)
-        else:
-            gray_region = box_region
-        
-        # 計算區域的寬高比（文字通常是橫向的）
-        box_width = x2 - x1
-        box_height = y2 - y1
-        aspect_ratio = box_width / max(box_height, 1)
-        
-        # 計算對比度（標準差）
-        contrast = np.std(gray_region)
-        
-        # 使用 Canny 邊緣檢測計算邊緣密度
-        edges = cv2.Canny(gray_region, 50, 150)
-        edge_density = np.sum(edges > 0) / max(box_width * box_height, 1)
-        
-        # 計算水平投影（文字通常有明顯的水平線條）
-        horizontal_projection = np.sum(gray_region < 128, axis=1)  # 暗像素數量
-        horizontal_variance = np.var(horizontal_projection)
-        
-        # 文字判斷條件：
-        # 1. 寬高比 > 1.5（橫向文字）
-        # 2. 對比度 > 30（高對比度）
-        # 3. 邊緣密度 > 0.1（邊緣密集）
-        # 4. 水平投影變異數 > 100（有明顯的水平線條特徵）
-        is_text = (
-            aspect_ratio > 1.5 and
-            contrast > 30 and
-            edge_density > 0.1 and
-            horizontal_variance > 100
-        )
-        
-        return is_text
     
     def detect(
         self,
@@ -810,7 +358,15 @@ class FasterRCNNDetector:
                 category_name = self.category_names.get(int(label_id), f"class_{label_id}")
                 logger.info(f"  {category_name} (id={label_id}): {label_mask.sum()} 個偵測")
                 logger.info(f"    信心值範圍: {label_scores.min().item():.4f} ~ {label_scores.max().item():.4f}")
-                logger.info(f"    平均信心值: {label_scores.mean().item():.4f}")
+                # 對於 colony 和 RFID，顯示更多統計信息
+                if category_name in ['colony', 'RFID']:
+                    threshold = thresholds_dict.get(category_name, 0.3) if use_category_thresholds else global_threshold
+                    above_threshold = (label_scores >= threshold).sum().item()
+                    below_threshold = (label_scores < threshold).sum().item()
+                    if below_threshold > 0:
+                        below_scores = label_scores[label_scores < threshold]
+                        logger.info(f"    高於閾值 {threshold:.3f}: {above_threshold} 個")
+                        logger.info(f"    低於閾值 {threshold:.3f}: {below_threshold} 個（範圍: {below_scores.min().item():.4f} ~ {below_scores.max().item():.4f}）")
         logger.info("=" * 60)
         
         if use_category_thresholds:
@@ -836,13 +392,19 @@ class FasterRCNNDetector:
                     label_keep = label_scores >= category_threshold
                     keep_mask[label_mask] = label_keep
                     
-                    # 調試：記錄過濾結果
+                    # 記錄過濾結果（改為 info 級別以便調試）
                     passed_count = label_keep.sum().item()
                     total_count = label_mask.sum().item()
                     if passed_count < total_count:
-                        logger.debug(f"  {category_name}: {total_count} 個偵測，{passed_count} 個通過閾值 {category_threshold}")
+                        filtered_count = total_count - passed_count
+                        filtered_scores = label_scores[~label_keep]
+                        if len(filtered_scores) > 0:
+                            min_filtered = filtered_scores.min().item()
+                            max_filtered = filtered_scores.max().item()
+                        else:
+                            logger.info(f"  {category_name}: {total_count} 個偵測，{passed_count} 個通過閾值 {category_threshold}")
                     elif passed_count > 0:
-                        logger.debug(f"  {category_name}: {passed_count} 個偵測全部通過閾值 {category_threshold}")
+                        logger.info(f"  {category_name}: {passed_count} 個偵測全部通過閾值 {category_threshold}")
         else:
             # 使用全域閾值
             keep_mask = scores >= global_threshold
@@ -850,6 +412,170 @@ class FasterRCNNDetector:
         boxes = prediction['boxes'][keep_mask]
         labels = labels[keep_mask]
         scores = scores[keep_mask]
+        
+        # 找出 RFID 的 category_id
+        rfid_category_id = None
+        for cat_id, cat_name in self.category_names.items():
+            if cat_name == 'RFID':
+                rfid_category_id = cat_id
+                break
+        
+        # RFID 處理：每張圖只保留信心度最高的 RFID
+        if rfid_category_id is not None:
+            rfid_mask = labels == rfid_category_id
+            rfid_count = rfid_mask.sum().item()
+            
+            if rfid_count > 1:
+                # 找出所有 RFID 檢測的索引
+                rfid_indices = torch.where(rfid_mask)[0]
+                rfid_scores = scores[rfid_indices]
+                
+                # 找出信心度最高的 RFID 索引
+                best_rfid_local_idx = rfid_scores.argmax()
+                best_rfid_idx = rfid_indices[best_rfid_local_idx]
+                best_rfid_score = rfid_scores[best_rfid_local_idx].item()
+                
+                # 創建新的 mask，只保留最好的 RFID 和其他所有非 RFID 檢測
+                new_keep_mask = torch.zeros(len(boxes), dtype=torch.bool, device=boxes.device)
+                # 保留所有非 RFID 檢測
+                new_keep_mask[~rfid_mask] = True
+                # 只保留最好的 RFID
+                new_keep_mask[best_rfid_idx] = True
+                
+                # 應用新的 mask
+                boxes = boxes[new_keep_mask]
+                labels = labels[new_keep_mask]
+                scores = scores[new_keep_mask]
+                
+                logger.info(f"檢測到 {rfid_count} 個 RFID，保留信心度最高的 (score: {best_rfid_score:.4f})")
+        
+        # 同類別 NMS：對每個類別分別進行 NMS 去重
+        if DetectionConfig.SAME_CLASS_NMS_ENABLED:
+            # 獲取所有非背景類別
+            unique_labels = torch.unique(labels)
+            unique_labels = unique_labels[unique_labels != 0]  # 排除背景類別
+            
+            if len(unique_labels) > 0:
+                total_before_same_class = len(boxes)
+                logger.info(f"開始同類別 NMS 處理: {total_before_same_class} 個檢測")
+                
+                # 收集所有要保留的索引
+                all_keep_indices = []
+                
+                for label_id in unique_labels:
+                    label_mask = labels == label_id
+                    label_count = label_mask.sum().item()
+                    
+                    if label_count > 1:
+                        # 找出該類別的所有檢測索引
+                        label_indices = torch.where(label_mask)[0]
+                        label_boxes = boxes[label_mask]
+                        label_scores = scores[label_mask]
+                        
+                        category_name = self.category_names.get(int(label_id), f"class_{label_id}")
+                        logger.debug(f"處理 {category_name} (id={label_id}): {label_count} 個檢測")
+                        
+                        # 使用 torchvision 的標準 NMS 函數進行去重
+                        # 所有類別使用相同的同類別 NMS 閾值
+                        nms_threshold = DetectionConfig.SAME_CLASS_NMS_IOU_THRESHOLD
+                        
+                        keep_indices_local = nms(
+                            label_boxes,
+                            label_scores,
+                            nms_threshold
+                        )
+                        
+                        # 轉換為原始 boxes 中的索引
+                        keep_label_indices = label_indices[keep_indices_local]
+                        removed_count = label_count - len(keep_indices_local)
+                        
+                        # 計算實際的重疊情況（用於調試）
+                        if removed_count == 0 and label_count > 1:
+                            # 如果沒有移除任何檢測，計算最大 IoU 來幫助調試
+                            iou_matrix = box_iou(label_boxes, label_boxes)
+                            # 排除對角線（自己與自己的 IoU = 1.0）
+                            iou_matrix = iou_matrix.fill_diagonal_(0)
+                            max_iou = iou_matrix.max().item()
+                            logger.info(
+                                f"  {category_name}: {label_count} 個檢測，"
+                                f"最大 IoU = {max_iou:.3f}，閾值 = {nms_threshold:.3f}，"
+                                f"未移除任何檢測（因為最大 IoU < 閾值）"
+                            )
+                        elif removed_count > 0:
+                            logger.info(
+                                f"  {category_name}: 移除 {removed_count} 個重疊檢測 "
+                                f"(IoU > {nms_threshold:.3f})，保留 {len(keep_indices_local)} 個"
+                            )
+                        
+                        # 添加到保留列表
+                        all_keep_indices.append(keep_label_indices)
+                    else:
+                        # 只有一個檢測，直接保留
+                        label_indices = torch.where(label_mask)[0]
+                        all_keep_indices.append(label_indices)
+                
+                # 合併所有保留的索引
+                if len(all_keep_indices) > 0:
+                    keep_indices = torch.cat(all_keep_indices)
+                    keep_indices = torch.sort(keep_indices)[0]  # 排序以保持順序
+                    
+                    # 應用 NMS 結果
+                    boxes = boxes[keep_indices]
+                    labels = labels[keep_indices]
+                    scores = scores[keep_indices]
+                    
+                    total_after_same_class = len(boxes)
+                    removed_total = total_before_same_class - total_after_same_class
+                    
+                    if removed_total > 0:
+                        logger.info(
+                            f"同類別 NMS 完成: 原始 {total_before_same_class} 個檢測，"
+                            f"移除 {removed_total} 個重疊檢測，"
+                            f"保留 {total_after_same_class} 個"
+                        )
+                    else:
+                        logger.info(f"同類別 NMS: 無重疊檢測，保留所有 {total_before_same_class} 個檢測")
+        
+        # 跨類別 NMS：對所有檢測框進行 NMS，不管類別
+        if DetectionConfig.CROSS_CLASS_NMS_ENABLED and len(boxes) > 1:
+            total_before = len(boxes)
+            logger.info(f"開始跨類別 NMS 處理: {total_before} 個檢測（所有類別）")
+            
+            # 使用 torchvision 的標準 NMS 函數進行跨類別去重
+            # 對所有檢測框進行 NMS，不管它們屬於哪個類別
+            keep_indices = nms(
+                boxes,
+                scores,
+                DetectionConfig.CROSS_CLASS_NMS_IOU_THRESHOLD
+            )
+            
+            removed_count = total_before - len(keep_indices)
+            
+            if removed_count > 0:
+                # 應用 NMS 結果
+                boxes = boxes[keep_indices]
+                labels = labels[keep_indices]
+                scores = scores[keep_indices]
+                
+                logger.info(
+                    f"跨類別 NMS 完成: 原始 {total_before} 個檢測，"
+                    f"移除 {removed_count} 個重疊檢測 (IoU > {DetectionConfig.CROSS_CLASS_NMS_IOU_THRESHOLD:.3f})，"
+                    f"保留 {len(keep_indices)} 個"
+                )
+            else:
+                # 計算實際的重疊情況（用於調試）
+                if total_before > 1:
+                    iou_matrix = box_iou(boxes, boxes)
+                    # 排除對角線（自己與自己的 IoU = 1.0）
+                    iou_matrix = iou_matrix.fill_diagonal_(0)
+                    max_iou = iou_matrix.max().item()
+                    logger.info(
+                        f"跨類別 NMS: {total_before} 個檢測，"
+                        f"最大 IoU = {max_iou:.3f}，閾值 = {DetectionConfig.CROSS_CLASS_NMS_IOU_THRESHOLD:.3f}，"
+                        f"未移除任何檢測（因為最大 IoU < 閾值）"
+                    )
+                else:
+                    logger.info(f"跨類別 NMS: 只有 {total_before} 個檢測，無需去重")
         
         # 轉換為 numpy 以便處理
         boxes_np = boxes.cpu().numpy()
@@ -876,13 +602,7 @@ class FasterRCNNDetector:
         # 保存原始圖像（用於返回和繪製）
         original_image = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         
-        # 執行第一次二值化分割（培養皿和背景）
-        petri_dish_region, crop_offset_first = self._binary_segment_petri_dish(img_bgr)
-        
-        # 執行第二次二值化分割（物件分割）
-        self._binary_segment_objects(petri_dish_region)
-        
-        # 預處理圖像（圓形檢測 + CLAHE，與 model.py 保持一致）
+        # 預處理圖像（CLAHE 增強）
         processed_rgb, crop_offset = self._preprocess_image(img_bgr)
         x_offset, y_offset = crop_offset
         
