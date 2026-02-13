@@ -1,0 +1,39 @@
+{
+  "version": "3.2.2",
+  "flags": {},
+  "shapes": [
+    {
+      "label": "RFID",
+      "score": null,
+      "points": [
+        [
+          56.29545454545457,
+          168.1818181818182
+        ],
+        [
+          161.97727272727275,
+          168.1818181818182
+        ],
+        [
+          161.97727272727275,
+          395.45454545454544
+        ],
+        [
+          56.29545454545457,
+          395.45454545454544
+        ]
+      ],
+      "group_id": null,
+      "description": "",
+      "difficult": false,
+      "shape_type": "rectangle",
+      "flags": {},
+      "attributes": {},
+      "kie_linking": []
+    }
+  ],
+  "imagePath": "20251212_023744_Z22222DS3620.jpg",
+  "imageData": null,
+  "imageHeight": 616,
+  "imageWidth": 616
+}

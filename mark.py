@@ -45,8 +45,8 @@ class DetectionConfig:
     # 類別特定閾值
     CATEGORY_THRESHOLDS = {
         'RFID': 0.5,
-        'colony': 0.18,
-        'point': 0.2
+        'colony': 0.21,
+        'point': 0.22
     }
     
     # 預處理配置（與 model.py 保持一致）
@@ -54,13 +54,20 @@ class DetectionConfig:
     PREPROCESS_SHARPEN_RADIUS = 5    # 銳化半徑
     PREPROCESS_CONTRAST_ALPHA = 1.0   # 對比度增強係數
     
-    # 同類別 NMS 配置(數值越高越不積極)
+    # 同類別 NMS 配置(數值高， 越不積極)
     SAME_CLASS_NMS_ENABLED = True
-    SAME_CLASS_NMS_IOU_THRESHOLD = 0.1
+    SAME_CLASS_NMS_IOU_THRESHOLD = 0.9
     
     # 跨類別 NMS 配置
     CROSS_CLASS_NMS_ENABLED = True
-    CROSS_CLASS_NMS_IOU_THRESHOLD = 0.1
+    CROSS_CLASS_NMS_IOU_THRESHOLD = 0.3
+    
+    # Colony 幾何判斷配置
+    COLONY_GEOMETRIC_FILTER_ENABLED = True
+    COLONY_MIN_CIRCULARITY = 0.2        # 最小圓形度（允許不規則形狀，如左上角的不規則 colony，降低以保留更多）
+    COLONY_MIN_ASPECT_RATIO = 0.3       # 最小寬高比（允許橢圓形）
+    COLONY_MAX_ASPECT_RATIO = 3.0       # 最大寬高比（過濾過長的形狀）
+    COLONY_MIN_COMPACTNESS = 0.2        # 最小緊湊度（降低以保留大 colony，即使檢測框較大）
     
     # 繪圖配置
     DRAW_SHOW_SCORES = True
@@ -250,6 +257,101 @@ class FasterRCNNDetector:
                 category_names[i] = f"class_{i}"
         
         return category_names
+    
+    @staticmethod
+    def _analyze_colony_geometry(
+        box: torch.Tensor,
+        original_image: np.ndarray
+    ) -> Dict[str, float]:
+        """
+        分析 colony 檢測框的幾何特徵
+        
+        返回：
+        - circularity: 圓形度 (0-1, 1 表示完美圓形)
+        - aspect_ratio: 寬高比
+        - compactness: 緊湊度 (實際面積 / 邊界框面積)
+        """
+        x1, y1, x2, y2 = box.cpu().numpy().astype(int)
+        h, w = original_image.shape[:2]
+        
+        # 確保座標在圖像範圍內
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
+        
+        if x2 <= x1 or y2 <= y1:
+            return {
+                'circularity': 0.0,
+                'aspect_ratio': 1.0,
+                'compactness': 0.0,
+                'valid': False
+            }
+        
+        # 提取邊界框區域
+        box_region = original_image[y1:y2, x1:x2]
+        
+        # 轉換為灰階（如果原本是 RGB）
+        if len(box_region.shape) == 3:
+            gray_region = cv2.cvtColor(box_region, cv2.COLOR_RGB2GRAY)
+        else:
+            gray_region = box_region
+        
+        # 計算寬高比
+        box_width = x2 - x1
+        box_height = y2 - y1
+        aspect_ratio = box_width / max(box_height, 1)
+        if aspect_ratio < 1.0:
+            aspect_ratio = 1.0 / aspect_ratio  # 統一為 >= 1.0
+        
+        # 使用 Otsu 二值化來分割 colony 區域
+        _, binary = cv2.threshold(gray_region, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # 反轉二值化（colony 通常是暗色）
+        binary = cv2.bitwise_not(binary)
+        
+        # 形態學操作：去除小噪點
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        
+        # 尋找輪廓
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            # 如果找不到輪廓，使用邊界框的簡單特徵
+            box_area = box_width * box_height
+            return {
+                'circularity': 0.5,  # 預設值
+                'aspect_ratio': aspect_ratio,
+                'compactness': 1.0,  # 假設完全填充
+                'valid': True
+            }
+        
+        # 找出最大的輪廓（通常是主要的 colony）
+        largest_contour = max(contours, key=cv2.contourArea)
+        contour_area = cv2.contourArea(largest_contour)
+        contour_perimeter = cv2.arcLength(largest_contour, True)
+        
+        # 計算圓形度：4π × 面積 / 周長²
+        if contour_perimeter > 0:
+            circularity = (4 * np.pi * contour_area) / (contour_perimeter ** 2)
+        else:
+            circularity = 0.0
+        
+        # 計算緊湊度：實際面積 / 邊界框面積
+        box_area = box_width * box_height
+        if box_area > 0:
+            compactness = contour_area / box_area
+        else:
+            compactness = 0.0
+        
+        return {
+            'circularity': float(circularity),
+            'aspect_ratio': float(aspect_ratio),
+            'compactness': float(compactness),
+            'valid': True
+        }
     
     @staticmethod
     def _preprocess_image(
@@ -449,6 +551,126 @@ class FasterRCNNDetector:
                 
                 logger.info(f"檢測到 {rfid_count} 個 RFID，保留信心度最高的 (score: {best_rfid_score:.4f})")
         
+        # Colony 幾何判斷和過濾
+        if DetectionConfig.COLONY_GEOMETRIC_FILTER_ENABLED and original_image is not None:
+            # 找出 colony 的 category_id
+            colony_category_id = None
+            for cat_id, cat_name in self.category_names.items():
+                if cat_name == 'colony':
+                    colony_category_id = cat_id
+                    break
+            
+            if colony_category_id is not None:
+                colony_mask = labels == colony_category_id
+                colony_count = colony_mask.sum().item()
+                
+                if colony_count > 0:
+                    colony_indices = torch.where(colony_mask)[0]
+                    colony_boxes = boxes[colony_mask]
+                    colony_scores = scores[colony_mask]
+                    
+                    valid_colony_mask = torch.ones(len(colony_indices), dtype=torch.bool, device=boxes.device)
+                    
+                    logger.info(f"開始 Colony 幾何判斷: {colony_count} 個檢測")
+                    
+                    for i, colony_box in enumerate(colony_boxes):
+                        geometry = FasterRCNNDetector._analyze_colony_geometry(
+                            colony_box, original_image
+                        )
+                        
+                        if not geometry['valid']:
+                            valid_colony_mask[i] = False
+                            logger.info(
+                                f"  過濾 Colony #{i+1} (無效的幾何特徵, "
+                                f"score: {colony_scores[i].item():.4f})"
+                            )
+                            continue
+                        
+                        # 檢查幾何特徵是否符合 colony 的特徵
+                        circularity = geometry['circularity']
+                        aspect_ratio = geometry['aspect_ratio']
+                        compactness = geometry['compactness']
+                        
+                        # 計算檢測框面積（用於判斷是否為大 colony）
+                        box_width = colony_box[2] - colony_box[0]
+                        box_height = colony_box[3] - colony_box[1]
+                        box_area = box_width * box_height
+                        
+                        # 計算圖像總面積（用於判斷相對大小）
+                        img_height, img_width = original_image.shape[:2]
+                        img_total_area = img_height * img_width
+                        area_ratio = box_area / img_total_area if img_total_area > 0 else 0
+                        
+                        # 對大 colony（面積比例 > 5%）使用更寬鬆的緊湊度標準
+                        is_large_colony = area_ratio > 0.05
+                        effective_min_compactness = DetectionConfig.COLONY_MIN_COMPACTNESS
+                        if is_large_colony:
+                            # 大 colony 的緊湊度標準降低一半
+                            effective_min_compactness = DetectionConfig.COLONY_MIN_COMPACTNESS * 0.5
+                        
+                        # 判斷是否符合條件
+                        is_valid = True
+                        reasons = []
+                        
+                        if circularity < DetectionConfig.COLONY_MIN_CIRCULARITY:
+                            is_valid = False
+                            reasons.append(f"圓形度過低 ({circularity:.3f} < {DetectionConfig.COLONY_MIN_CIRCULARITY})")
+                        
+                        if aspect_ratio < DetectionConfig.COLONY_MIN_ASPECT_RATIO:
+                            is_valid = False
+                            reasons.append(f"寬高比過小 ({aspect_ratio:.3f} < {DetectionConfig.COLONY_MIN_ASPECT_RATIO})")
+                        
+                        if aspect_ratio > DetectionConfig.COLONY_MAX_ASPECT_RATIO:
+                            is_valid = False
+                            reasons.append(f"寬高比過大 ({aspect_ratio:.3f} > {DetectionConfig.COLONY_MAX_ASPECT_RATIO})")
+                        
+                        if compactness < effective_min_compactness:
+                            is_valid = False
+                            reasons.append(
+                                f"緊湊度過低 ({compactness:.3f} < {effective_min_compactness:.3f}"
+                                f"{' (大 colony 寬鬆標準)' if is_large_colony else ''})"
+                            )
+                        
+                        if not is_valid:
+                            valid_colony_mask[i] = False
+                            logger.info(
+                                f"  過濾 Colony #{i+1} (score: {colony_scores[i].item():.4f}, "
+                                f"circularity: {circularity:.3f}, aspect_ratio: {aspect_ratio:.3f}, "
+                                f"compactness: {compactness:.3f}) - {', '.join(reasons)}"
+                            )
+                        else:
+                            logger.debug(
+                                f"  保留 Colony #{i+1} (score: {colony_scores[i].item():.4f}, "
+                                f"circularity: {circularity:.3f}, aspect_ratio: {aspect_ratio:.3f}, "
+                                f"compactness: {compactness:.3f})"
+                            )
+                    
+                    # 應用幾何過濾
+                    if not valid_colony_mask.all():
+                        valid_colony_indices = colony_indices[valid_colony_mask]
+                        valid_count = len(valid_colony_indices)
+                        removed_count = colony_count - valid_count
+                        
+                        # 創建新的 mask，只保留有效的 colony 和其他所有非 colony 檢測
+                        new_keep_mask = torch.zeros(len(boxes), dtype=torch.bool, device=boxes.device)
+                        # 保留所有非 colony 檢測
+                        new_keep_mask[~colony_mask] = True
+                        # 只保留有效的 colony
+                        new_keep_mask[valid_colony_indices] = True
+                        
+                        # 應用新的 mask
+                        boxes = boxes[new_keep_mask]
+                        labels = labels[new_keep_mask]
+                        scores = scores[new_keep_mask]
+                        
+                        logger.info(
+                            f"Colony 幾何過濾完成: 原始 {colony_count} 個檢測，"
+                            f"移除 {removed_count} 個不符合幾何特徵的檢測，"
+                            f"保留 {valid_count} 個"
+                        )
+                    else:
+                        logger.info(f"Colony 幾何判斷: 所有 {colony_count} 個檢測都符合幾何特徵")
+        
         # 同類別 NMS：對每個類別分別進行 NMS 去重
         if DetectionConfig.SAME_CLASS_NMS_ENABLED:
             # 獲取所有非背景類別
@@ -576,6 +798,96 @@ class FasterRCNNDetector:
                     )
                 else:
                     logger.info(f"跨類別 NMS: 只有 {total_before} 個檢測，無需去重")
+        
+        # Point 處理：每張圖最多只保留 2 個信心度最高的 point，且信心度必須大於 0.26
+        point_category_id = None
+        for cat_id, cat_name in self.category_names.items():
+            if cat_name == 'point':
+                point_category_id = cat_id
+                break
+        
+        if point_category_id is not None:
+            point_mask = labels == point_category_id
+            point_count = point_mask.sum().item()
+            
+            if point_count > 0:
+                # 找出所有 point 檢測的索引
+                point_indices = torch.where(point_mask)[0]
+                point_scores = scores[point_indices]
+                
+                # 先過濾掉信心度 <= 0.26 的 point
+                point_min_threshold = 0.26
+                valid_point_mask = point_scores > point_min_threshold
+                valid_point_indices = point_indices[valid_point_mask]
+                valid_point_scores = point_scores[valid_point_mask]
+                valid_point_count = valid_point_mask.sum().item()
+                
+                # 記錄被過濾掉的 point
+                filtered_by_threshold = point_count - valid_point_count
+                if filtered_by_threshold > 0:
+                    filtered_scores = point_scores[~valid_point_mask]
+                    logger.info(
+                        f"Point 信心度過濾: 原始 {point_count} 個檢測，"
+                        f"移除 {filtered_by_threshold} 個信心度 <= {point_min_threshold} 的檢測 "
+                        f"(範圍: {filtered_scores.min().item():.4f} ~ {filtered_scores.max().item():.4f})"
+                    )
+                
+                # 從符合信心度要求的 point 中，選擇最多 2 個信心度最高的
+                if valid_point_count > 2:
+                    # 使用 topk 來獲取前 2 個最高分數的索引
+                    top2_point_local_indices = valid_point_scores.topk(2).indices
+                    top2_point_indices = valid_point_indices[top2_point_local_indices]
+                    top2_point_scores = valid_point_scores[top2_point_local_indices].tolist()
+                    
+                    # 創建新的 mask，只保留最好的 2 個 point 和其他所有非 point 檢測
+                    new_keep_mask = torch.zeros(len(boxes), dtype=torch.bool, device=boxes.device)
+                    # 保留所有非 point 檢測
+                    new_keep_mask[~point_mask] = True
+                    # 只保留最好的 2 個 point
+                    new_keep_mask[top2_point_indices] = True
+                    
+                    # 應用新的 mask
+                    boxes = boxes[new_keep_mask]
+                    labels = labels[new_keep_mask]
+                    scores = scores[new_keep_mask]
+                    
+                    logger.info(
+                        f"Point 數量限制: {valid_point_count} 個符合信心度要求的檢測，"
+                        f"保留信心度最高的 2 個 (scores: {', '.join([f'{s:.4f}' for s in top2_point_scores])})"
+                    )
+                elif valid_point_count > 0:
+                    # 符合信心度要求的 point 數量 <= 2，全部保留
+                    # 但需要過濾掉不符合信心度要求的 point
+                    new_keep_mask = torch.zeros(len(boxes), dtype=torch.bool, device=boxes.device)
+                    # 保留所有非 point 檢測
+                    new_keep_mask[~point_mask] = True
+                    # 只保留符合信心度要求的 point
+                    new_keep_mask[valid_point_indices] = True
+                    
+                    # 應用新的 mask
+                    boxes = boxes[new_keep_mask]
+                    labels = labels[new_keep_mask]
+                    scores = scores[new_keep_mask]
+                    
+                    logger.info(
+                        f"Point 過濾完成: {point_count} 個原始檢測，"
+                        f"{filtered_by_threshold} 個因信心度 <= {point_min_threshold} 被過濾，"
+                        f"保留 {valid_point_count} 個符合要求的檢測 "
+                        f"(scores: {', '.join([f'{s:.4f}' for s in valid_point_scores.tolist()])})"
+                    )
+                else:
+                    # 所有 point 都不符合信心度要求，全部過濾掉
+                    new_keep_mask = ~point_mask
+                    
+                    # 應用新的 mask
+                    boxes = boxes[new_keep_mask]
+                    labels = labels[new_keep_mask]
+                    scores = scores[new_keep_mask]
+                    
+                    logger.info(
+                        f"Point 過濾完成: {point_count} 個原始檢測，"
+                        f"全部因信心度 <= {point_min_threshold} 被過濾"
+                    )
         
         # 轉換為 numpy 以便處理
         boxes_np = boxes.cpu().numpy()

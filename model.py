@@ -88,7 +88,8 @@ class FasterRCNNDataset(Dataset):
         scale_max: float = AUGMENTATION_SCALE_MAX,
         rotate_degrees: float = AUGMENTATION_ROTATE_DEGREES,
         flip_horizontal_prob: float = AUGMENTATION_FLIP_HORIZONTAL_PROB,
-        flip_vertical_prob: float = AUGMENTATION_FLIP_VERTICAL_PROB
+        flip_vertical_prob: float = AUGMENTATION_FLIP_VERTICAL_PROB,
+        negative_sample_dir: Optional[str] = None  # 負樣本目錄（nsamples）
     ):
         
         self.image_dir = Path(image_dir)
@@ -111,10 +112,22 @@ class FasterRCNNDataset(Dataset):
             transforms.ToTensor()
         ])
         
-        # 載入圖像列表
+        # 載入圖像列表（包含負樣本）
         self.image_files = self._load_image_files()
         if not self.image_files:
             raise ValueError(f"在 {self.image_dir} 中未找到圖像檔案")
+        
+        # 載入負樣本（如果提供）
+        self.negative_sample_dir = Path(negative_sample_dir) if negative_sample_dir else None
+        negative_image_files = []
+        negative_annotations = {}
+        if self.negative_sample_dir and self.negative_sample_dir.exists():
+            negative_image_files = self._load_negative_sample_images()
+            if negative_image_files:
+                negative_annotations = self._load_negative_sample_annotations()
+                # 合併負樣本圖片到訓練集
+                self.image_files.extend(negative_image_files)
+                logger.info(f"已載入 {len(negative_image_files)} 張負樣本圖片")
         
         # 載入標註
         self.annotations = {}
@@ -122,6 +135,42 @@ class FasterRCNNDataset(Dataset):
         self.annotation_file = annotation_file
         if annotation_file and Path(annotation_file).exists():
             self.annotations, self.image_id_map = self._load_annotations(annotation_file)
+        
+        # 合併負樣本標註（只保留 RFID，不包含 colony/point）
+        # 需要先載入類別映射，以便正確映射類別 ID
+        if negative_annotations:
+            # 載入類別映射（從主標註中）
+            category_mapping = FasterRCNNDataset._load_category_mapping(
+                self.annotation_file, self.annotations
+            )
+            
+            # 建立類別名稱到 ID 的映射
+            category_name_to_id = {name: cat_id for cat_id, name in category_mapping.items()}
+            
+            # 如果主標註中沒有 RFID 類別，需要添加（但這不應該發生，因為 RFID 應該是主要類別之一）
+            if 'RFID' not in category_name_to_id:
+                logger.warning("主標註中未找到 RFID 類別，負樣本的 RFID 標註可能無法正確映射")
+            
+            for filename, anns in negative_annotations.items():
+                if filename not in self.annotations:
+                    self.annotations[filename] = []
+                
+                # 只添加 RFID 標註，過濾掉 colony 和 point
+                rfid_count = 0
+                for ann in anns:
+                    category_name = ann.get('category_name', '')
+                    if category_name == 'RFID':
+                        # 使用正確的類別 ID（從類別映射中獲取）
+                        correct_category_id = category_name_to_id.get('RFID')
+                        if correct_category_id is not None:
+                            ann['category_id'] = correct_category_id
+                            self.annotations[filename].append(ann)
+                            rfid_count += 1
+                        else:
+                            logger.warning(f"負樣本 {filename}: 無法映射 RFID 類別 ID，跳過標註")
+                
+                if rfid_count > 0:
+                    logger.info(f"負樣本 {filename}: 添加了 {rfid_count} 個 RFID 標註（類別 ID: {category_name_to_id.get('RFID', 'N/A')}）")
         
         # 準備 grayscale 目錄（用於保存灰階圖片）
         if SAVE_GRAYSCALE:
@@ -139,6 +188,123 @@ class FasterRCNNDataset(Dataset):
             image_files.extend(self.image_dir.glob(f"*{ext.upper()}"))
         
         return sorted([str(f) for f in image_files])
+    
+    def _load_negative_sample_images(self) -> List[str]:
+        """載入負樣本圖片列表"""
+        if not self.negative_sample_dir or not self.negative_sample_dir.exists():
+            return []
+        
+        image_files = []
+        for ext in self.IMAGE_EXTENSIONS:
+            image_files.extend(self.negative_sample_dir.glob(f"*{ext}"))
+            image_files.extend(self.negative_sample_dir.glob(f"*{ext.upper()}"))
+        
+        return sorted([str(f) for f in image_files])
+    
+    def _load_negative_sample_annotations(self) -> Dict[str, List[Dict]]:
+        """載入負樣本標註（LabelMe 格式）"""
+        if not self.negative_sample_dir or not self.negative_sample_dir.exists():
+            return {}
+        
+        annotations_dict = {}
+        category_name_to_id = {}  # 臨時映射，後續會與主標註合併
+        next_category_id = 1
+        
+        # 查找所有 JSON 標註檔案
+        json_files = list(self.negative_sample_dir.glob("*.json"))
+        
+        for json_file in json_files:
+            try:
+                with open(json_file, 'r', encoding='utf-8') as f:
+                    labelme_data = json.load(f)
+                
+                # 檢查是否為 LabelMe 格式
+                if 'shapes' not in labelme_data or 'imagePath' not in labelme_data:
+                    continue
+                
+                filename = labelme_data.get('imagePath', json_file.stem + '.jpg')
+                image_width = labelme_data.get('imageWidth', labelme_data.get('image_width', 0))
+                image_height = labelme_data.get('imageHeight', labelme_data.get('image_height', 0))
+                
+                if image_width == 0 or image_height == 0:
+                    logger.warning(f"負樣本 {json_file.name}: 無法取得圖片尺寸，跳過")
+                    continue
+                
+                # 確保圖片檔案存在
+                image_path = self.negative_sample_dir / filename
+                if not image_path.exists():
+                    # 嘗試其他擴展名
+                    found = False
+                    for ext in self.IMAGE_EXTENSIONS:
+                        alt_path = self.negative_sample_dir / (Path(filename).stem + ext)
+                        if alt_path.exists():
+                            filename = alt_path.name
+                            found = True
+                            break
+                    if not found:
+                        logger.debug(f"負樣本 {json_file.name}: 找不到對應的圖片檔案，跳過")
+                        continue
+                
+                if filename not in annotations_dict:
+                    annotations_dict[filename] = []
+                
+                # 轉換 LabelMe 標註為 COCO 格式
+                shapes = labelme_data.get('shapes', [])
+                for shape_idx, shape in enumerate(shapes):
+                    label = shape.get('label', '')
+                    shape_type = shape.get('shape_type', '')
+                    points = shape.get('points', [])
+                    
+                    if not label or not points:
+                        continue
+                    
+                    # 分配類別 ID（臨時，後續會與主標註合併）
+                    if label not in category_name_to_id:
+                        category_name_to_id[label] = next_category_id
+                        next_category_id += 1
+                    category_id = category_name_to_id[label]
+                    
+                    # 轉換邊界框
+                    bbox = None
+                    if shape_type == 'rectangle' and len(points) >= 2:
+                        # 矩形：使用兩個點
+                        x_coords = [p[0] for p in points]
+                        y_coords = [p[1] for p in points]
+                        x_min = max(0, min(x_coords))
+                        y_min = max(0, min(y_coords))
+                        x_max = min(image_width, max(x_coords))
+                        y_max = min(image_height, max(y_coords))
+                        width = x_max - x_min
+                        height = y_max - y_min
+                        bbox = [x_min, y_min, width, height]
+                    elif shape_type == 'polygon' and len(points) >= 3:
+                        # 多邊形：計算最小外接矩形
+                        x_coords = [p[0] for p in points]
+                        y_coords = [p[1] for p in points]
+                        x_min = max(0, min(x_coords))
+                        y_min = max(0, min(y_coords))
+                        x_max = min(image_width, max(x_coords))
+                        y_max = min(image_height, max(y_coords))
+                        width = x_max - x_min
+                        height = y_max - y_min
+                        bbox = [x_min, y_min, width, height]
+                    
+                    if bbox and width > 0 and height > 0:
+                        annotations_dict[filename].append({
+                            'id': len(annotations_dict[filename]) + 1,
+                            'image_id': filename,
+                            'category_id': category_id,
+                            'category_name': label,  # 保存類別名稱
+                            'bbox': bbox,  # COCO 格式: [x, y, width, height]
+                            'area': width * height,
+                            'iscrowd': 0
+                        })
+            
+            except Exception as e:
+                logger.warning(f"無法載入負樣本標註 {json_file.name}: {e}")
+                continue
+        
+        return annotations_dict
     
     @staticmethod
     def _load_xml_annotations(annotation_file: str, image_dir: Path) -> Tuple[Dict, Dict]:
@@ -568,6 +734,14 @@ class FasterRCNNDataset(Dataset):
         image_path = Path(self.image_files[idx])
         filename = image_path.name
         
+        # 檢查圖片路徑是否存在（可能是負樣本，路徑不同）
+        if not image_path.exists():
+            # 如果是負樣本，路徑在 negative_sample_dir
+            if self.negative_sample_dir and (self.negative_sample_dir / filename).exists():
+                image_path = self.negative_sample_dir / filename
+            else:
+                raise FileNotFoundError(f"找不到圖片檔案: {self.image_files[idx]}")
+        
         # 獲取對應的標註
         filename = os.path.basename(image_path)
         annotations = self._get_coco_annotations_for_image(filename)
@@ -575,7 +749,11 @@ class FasterRCNNDataset(Dataset):
         # 載入類別映射（如果標註檔案存在）
         category_names = None
         if self.annotation_file and Path(self.annotation_file).exists():
-            category_names = FasterRCNNDataset._load_category_mapping(self.annotation_file)
+            category_names = FasterRCNNDataset._load_category_mapping(self.annotation_file, self.annotations)
+        
+        # 如果沒有從標註檔案載入類別映射，從 annotations_dict 中提取（XML 格式或負樣本）
+        if not category_names or len(category_names) <= 1:
+            category_names = FasterRCNNDataset._load_category_mapping(None, self.annotations)
         
         # 使用預處理方法（轉灰階 → 銳利化 → 降噪 → 對比度增強，保持尺寸不變）
         processed_gray = self._preprocess_image(
@@ -848,7 +1026,8 @@ class FasterRCNNTrainer:
         val_image_dir: str = "model/val/images",
         val_annotation_file: str = "model/val/annotations.json",
         output_dir: str = "run",
-        num_classes: int = 2
+        num_classes: int = 2,
+        negative_sample_dir: Optional[str] = "nsamples"  # 負樣本目錄
     ):
         
         self.train_image_dir = Path(train_image_dir)
@@ -858,6 +1037,7 @@ class FasterRCNNTrainer:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.num_classes = num_classes
+        self.negative_sample_dir = negative_sample_dir  # 負樣本目錄
         
         # 載入預訓練模型
         self.model = self._load_model(num_classes)
@@ -923,11 +1103,15 @@ class FasterRCNNTrainer:
         # 訓練集啟用資料擴增，驗證集關閉（已改為全域關閉）
         enable_aug = AUGMENTATION_ENABLED  # 使用全域設定，目前為 False
         
+        # 只在訓練集添加負樣本，驗證集不添加
+        negative_dir = self.negative_sample_dir if dataset_name == "訓練集" else None
+        
         dataset = FasterRCNNDataset(
             image_dir=str(image_dir),
             annotation_file=ann_file,
             dataset_name=dataset_name,
-            enable_augmentation=enable_aug
+            enable_augmentation=enable_aug,
+            negative_sample_dir=negative_dir
         )
         
         logger.info(f"  {dataset_name}大小: {len(dataset)} 張圖像")
