@@ -10,7 +10,7 @@ from PIL import Image
 class AnnotationConverter:
     
     
-    def __init__(self, input_dir: str = "c1", output_dir: str = "c2", category_name: str = "object"):
+    def __init__(self, input_dir: str = "c1", output_dir: str = "nsamples", category_name: str = "object"):
         
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -367,16 +367,10 @@ def main():
     print("3. 轉換後的 COCO 格式會輸出到 c2/ 目錄")
     print()
     
-    # 檢查輸入目錄
-    if not os.path.exists("c1"):
-        print("錯誤: c1/ 目錄不存在")
-        print("請先創建 c1/ 目錄，並將標記的圖片和 JSON 檔案放入其中")
-        return
-    
     # 創建轉換器（可以自訂類別名稱）
     converter = AnnotationConverter(
         input_dir="c1",
-        output_dir="c2",
+        output_dir="nsamples",
         category_name="object"  # 如果您的類別名稱不同，請修改這裡
     )
     
@@ -406,11 +400,7 @@ def main():
                 print(f"  ✓ 已刪除 {deleted_count} 個項目")
             except Exception as e:
                 print(f"  ✗ 刪除時發生錯誤: {e}")
-        
-        print(f"\n接下來可以：")
-        print(f"  1. 將 c2/images/ 的圖片複製到 model/train/images/ 或 model/val/images/")
-        print(f"  2. 將 c2/annotations.json 複製到 model/train/annotations/train.json 或 model/val/annotations/val.json")
-        print(f"  3. 執行 data_preparation.py 進行預處理")
+
     else:
         print("✗ 轉換失敗，請檢查錯誤訊息")
 

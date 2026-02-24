@@ -9,7 +9,7 @@ __pycache__/
 venv/
 env/
 ENV/
-.venv
+.venv/
 
 # IDE
 .vscode/
@@ -48,3 +48,12 @@ Thumbs.db
 # Data files (large files, uncomment if needed)
 # *.h5
 # *.hdf5
+
+# Project specific data/outputs
+final/output/
+# final/output/*.jpg   # 已由上方目錄規則涵蓋
+# final/output/*.json  # 已由上方目錄規則涵蓋
+c1/
+c2/
+nsamples/
+grayscale/
