@@ -45,7 +45,7 @@ class DetectionConfig:
     # 類別特定閾值
     CATEGORY_THRESHOLDS = {
         'RFID': 0.5,
-        'colony': 0.21,
+        'colony': 0.365,
         'point': 0.22
     }
     
@@ -56,14 +56,15 @@ class DetectionConfig:
     
     # 同類別 NMS 配置(數值高， 越不積極)
     SAME_CLASS_NMS_ENABLED = True
-    SAME_CLASS_NMS_IOU_THRESHOLD = 0.9
+    SAME_CLASS_NMS_IOU_THRESHOLD = 0.2
+    
     
     # 跨類別 NMS 配置
     CROSS_CLASS_NMS_ENABLED = True
     CROSS_CLASS_NMS_IOU_THRESHOLD = 0.3
     
     # Colony 幾何判斷配置
-    COLONY_GEOMETRIC_FILTER_ENABLED = True
+    COLONY_GEOMETRIC_FILTER_ENABLED = False  # 暫時關閉幾何過濾
     COLONY_MIN_CIRCULARITY = 0.2        # 最小圓形度（允許不規則形狀，如左上角的不規則 colony，降低以保留更多）
     COLONY_MIN_ASPECT_RATIO = 0.3       # 最小寬高比（允許橢圓形）
     COLONY_MAX_ASPECT_RATIO = 3.0       # 最大寬高比（過濾過長的形狀）
@@ -354,6 +355,52 @@ class FasterRCNNDetector:
         }
     
     @staticmethod
+    def _is_point_inside_rfid(
+        point_box: torch.Tensor,
+        rfid_box: torch.Tensor
+    ) -> bool:
+        """
+        檢查 point 是否在 RFID 內部
+        
+        參數:
+            point_box: point 的邊界框 [x1, y1, x2, y2]
+            rfid_box: RFID 的邊界框 [x1, y1, x2, y2]
+        
+        返回:
+            True 如果 point 的中心點在 RFID 內部
+        """
+        # 計算 point 的中心點
+        point_center_x = (point_box[0] + point_box[2]) / 2
+        point_center_y = (point_box[1] + point_box[3]) / 2
+        
+        # 檢查中心點是否在 RFID 邊界框內
+        return (rfid_box[0] <= point_center_x <= rfid_box[2] and
+                rfid_box[1] <= point_center_y <= rfid_box[3])
+    
+    @staticmethod
+    def _is_point_inside_colony(
+        point_box: torch.Tensor,
+        colony_box: torch.Tensor
+    ) -> bool:
+        """
+        檢查 point 是否在 colony 內部
+        
+        參數:
+            point_box: point 的邊界框 [x1, y1, x2, y2]
+            colony_box: colony 的邊界框 [x1, y1, x2, y2]
+        
+        返回:
+            True 如果 point 的中心點在 colony 內部
+        """
+        # 計算 point 的中心點
+        point_center_x = (point_box[0] + point_box[2]) / 2
+        point_center_y = (point_box[1] + point_box[3]) / 2
+        
+        # 檢查中心點是否在 colony 邊界框內
+        return (colony_box[0] <= point_center_x <= colony_box[2] and
+                colony_box[1] <= point_center_y <= colony_box[3])
+    
+    @staticmethod
     def _preprocess_image(
         img: np.ndarray
     ) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -551,6 +598,68 @@ class FasterRCNNDetector:
                 
                 logger.info(f"檢測到 {rfid_count} 個 RFID，保留信心度最高的 (score: {best_rfid_score:.4f})")
         
+        # RFID 內 Point 過濾：RFID 內的 point 必須信心度 > 0.4 才保留
+        if rfid_category_id is not None:
+            # 找出 point 的 category_id
+            point_category_id = None
+            for cat_id, cat_name in self.category_names.items():
+                if cat_name == 'point':
+                    point_category_id = cat_id
+                    break
+            
+            if point_category_id is not None:
+                rfid_mask = labels == rfid_category_id
+                point_mask = labels == point_category_id
+                rfid_count = rfid_mask.sum().item()
+                point_count = point_mask.sum().item()
+                
+                if rfid_count > 0 and point_count > 0:
+                    # 找出所有 RFID 和 point 的索引
+                    rfid_indices = torch.where(rfid_mask)[0]
+                    point_indices = torch.where(point_mask)[0]
+                    rfid_boxes = boxes[rfid_indices]
+                    point_boxes = boxes[point_indices]
+                    point_scores = scores[point_indices]
+                    
+                    # 檢查每個 point 是否在 RFID 內部
+                    points_to_remove = []
+                    rfid_internal_point_threshold = 0.48
+                    
+                    for i, point_idx in enumerate(point_indices):
+                        point_box = boxes[point_idx]
+                        point_score = scores[point_idx].item()
+                        
+                        # 檢查是否在任何 RFID 內部
+                        is_inside_rfid = False
+                        for rfid_box in rfid_boxes:
+                            if FasterRCNNDetector._is_point_inside_rfid(point_box, rfid_box):
+                                is_inside_rfid = True
+                                break
+                        
+                        # 如果在 RFID 內部且信心度 <= 0.4，標記為移除
+                        if is_inside_rfid and point_score <= rfid_internal_point_threshold:
+                            points_to_remove.append(point_idx)
+                            logger.info(
+                                f"移除 RFID 內的 Point (score: {point_score:.4f} <= {rfid_internal_point_threshold}, "
+                                f"bbox: [{point_box[0]:.1f}, {point_box[1]:.1f}, {point_box[2]:.1f}, {point_box[3]:.1f}])"
+                            )
+                    
+                    # 如果有需要移除的 point，創建新的 mask
+                    if len(points_to_remove) > 0:
+                        points_to_remove_set = set(points_to_remove)
+                        new_keep_mask = torch.ones(len(boxes), dtype=torch.bool, device=boxes.device)
+                        for point_idx in points_to_remove_set:
+                            new_keep_mask[point_idx] = False
+                        
+                        # 應用新的 mask
+                        boxes = boxes[new_keep_mask]
+                        labels = labels[new_keep_mask]
+                        scores = scores[new_keep_mask]
+                        
+                        logger.info(
+                            f"RFID 內 Point 過濾完成: 移除 {len(points_to_remove)} 個信心度 <= {rfid_internal_point_threshold} 的 point"
+                        )
+        
         # Colony 幾何判斷和過濾
         if DetectionConfig.COLONY_GEOMETRIC_FILTER_ENABLED and original_image is not None:
             # 找出 colony 的 category_id
@@ -670,6 +779,75 @@ class FasterRCNNDetector:
                         )
                     else:
                         logger.info(f"Colony 幾何判斷: 所有 {colony_count} 個檢測都符合幾何特徵")
+        
+        # Colony 內 Point 過濾：Colony 內的 point 必須信心度 > 0.4 才保留
+        # 找出 colony 的 category_id
+        colony_category_id = None
+        for cat_id, cat_name in self.category_names.items():
+            if cat_name == 'colony':
+                colony_category_id = cat_id
+                break
+        
+        if colony_category_id is not None:
+            # 找出 point 的 category_id
+            point_category_id = None
+            for cat_id, cat_name in self.category_names.items():
+                if cat_name == 'point':
+                    point_category_id = cat_id
+                    break
+            
+            if point_category_id is not None:
+                colony_mask = labels == colony_category_id
+                point_mask = labels == point_category_id
+                colony_count = colony_mask.sum().item()
+                point_count = point_mask.sum().item()
+                
+                if colony_count > 0 and point_count > 0:
+                    # 找出所有 colony 和 point 的索引
+                    colony_indices = torch.where(colony_mask)[0]
+                    point_indices = torch.where(point_mask)[0]
+                    colony_boxes = boxes[colony_indices]
+                    point_boxes = boxes[point_indices]
+                    point_scores = scores[point_indices]
+                    
+                    # 檢查每個 point 是否在 colony 內部
+                    points_to_remove = []
+                    colony_internal_point_threshold = 0.4
+                    
+                    for i, point_idx in enumerate(point_indices):
+                        point_box = boxes[point_idx]
+                        point_score = scores[point_idx].item()
+                        
+                        # 檢查是否在任何 colony 內部
+                        is_inside_colony = False
+                        for colony_box in colony_boxes:
+                            if FasterRCNNDetector._is_point_inside_colony(point_box, colony_box):
+                                is_inside_colony = True
+                                break
+                        
+                        # 如果在 colony 內部且信心度 <= 0.4，標記為移除
+                        if is_inside_colony and point_score <= colony_internal_point_threshold:
+                            points_to_remove.append(point_idx)
+                            logger.info(
+                                f"移除 Colony 內的 Point (score: {point_score:.4f} <= {colony_internal_point_threshold}, "
+                                f"bbox: [{point_box[0]:.1f}, {point_box[1]:.1f}, {point_box[2]:.1f}, {point_box[3]:.1f}])"
+                            )
+                    
+                    # 如果有需要移除的 point，創建新的 mask
+                    if len(points_to_remove) > 0:
+                        points_to_remove_set = set(points_to_remove)
+                        new_keep_mask = torch.ones(len(boxes), dtype=torch.bool, device=boxes.device)
+                        for point_idx in points_to_remove_set:
+                            new_keep_mask[point_idx] = False
+                        
+                        # 應用新的 mask
+                        boxes = boxes[new_keep_mask]
+                        labels = labels[new_keep_mask]
+                        scores = scores[new_keep_mask]
+                        
+                        logger.info(
+                            f"Colony 內 Point 過濾完成: 移除 {len(points_to_remove)} 個信心度 <= {colony_internal_point_threshold} 的 point"
+                        )
         
         # 同類別 NMS：對每個類別分別進行 NMS 去重
         if DetectionConfig.SAME_CLASS_NMS_ENABLED:

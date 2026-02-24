@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # 訓練配置常量（優化以充分利用 RTX 5090）
 DEFAULT_NUM_EPOCHS = 10
-DEFAULT_BATCH_SIZE = 8  # 降低批次大小以避免 CUDA 記憶體不足
+DEFAULT_BATCH_SIZE = 2  # 降低批次大小以避免 CUDA 記憶體不足（多進程環境下需要更小）
 DEFAULT_LEARNING_RATE = 0.005
 DEFAULT_MOMENTUM = 0.9
 DEFAULT_WEIGHT_DECAY = 0.0005
@@ -125,6 +125,7 @@ class FasterRCNNDataset(Dataset):
             negative_image_files = self._load_negative_sample_images()
             if negative_image_files:
                 negative_annotations = self._load_negative_sample_annotations()
+                
                 # 合併負樣本圖片到訓練集
                 self.image_files.extend(negative_image_files)
                 logger.info(f"已載入 {len(negative_image_files)} 張負樣本圖片")
@@ -136,41 +137,26 @@ class FasterRCNNDataset(Dataset):
         if annotation_file and Path(annotation_file).exists():
             self.annotations, self.image_id_map = self._load_annotations(annotation_file)
         
-        # 合併負樣本標註（只保留 RFID，不包含 colony/point）
-        # 需要先載入類別映射，以便正確映射類別 ID
+        # 合併負樣本標註（只保留 text 類別，映射為背景類別 ID 0）
+        # text 標註用於防止模型將文字區域錯誤檢測為 colony 或 point
         if negative_annotations:
-            # 載入類別映射（從主標註中）
-            category_mapping = FasterRCNNDataset._load_category_mapping(
-                self.annotation_file, self.annotations
-            )
-            
-            # 建立類別名稱到 ID 的映射
-            category_name_to_id = {name: cat_id for cat_id, name in category_mapping.items()}
-            
-            # 如果主標註中沒有 RFID 類別，需要添加（但這不應該發生，因為 RFID 應該是主要類別之一）
-            if 'RFID' not in category_name_to_id:
-                logger.warning("主標註中未找到 RFID 類別，負樣本的 RFID 標註可能無法正確映射")
-            
             for filename, anns in negative_annotations.items():
                 if filename not in self.annotations:
                     self.annotations[filename] = []
                 
-                # 只添加 RFID 標註，過濾掉 colony 和 point
-                rfid_count = 0
+                # 只添加 text 標註，過濾掉其他類別
+                text_count = 0
                 for ann in anns:
                     category_name = ann.get('category_name', '')
-                    if category_name == 'RFID':
-                        # 使用正確的類別 ID（從類別映射中獲取）
-                        correct_category_id = category_name_to_id.get('RFID')
-                        if correct_category_id is not None:
-                            ann['category_id'] = correct_category_id
-                            self.annotations[filename].append(ann)
-                            rfid_count += 1
-                        else:
-                            logger.warning(f"負樣本 {filename}: 無法映射 RFID 類別 ID，跳過標註")
+                    if category_name == 'text':
+                        # 將 text 映射為背景類別（類別 ID 0）
+                        # 這樣模型會學習這些區域不應該被檢測為任何類別
+                        ann['category_id'] = 0  # 背景類別
+                        self.annotations[filename].append(ann)
+                        text_count += 1
                 
-                if rfid_count > 0:
-                    logger.info(f"負樣本 {filename}: 添加了 {rfid_count} 個 RFID 標註（類別 ID: {category_name_to_id.get('RFID', 'N/A')}）")
+                if text_count > 0:
+                    logger.info(f"負樣本 {filename}: 添加了 {text_count} 個 text 標註（映射為背景類別 ID: 0）")
         
         # 準備 grayscale 目錄（用於保存灰階圖片）
         if SAVE_GRAYSCALE:
@@ -194,19 +180,96 @@ class FasterRCNNDataset(Dataset):
         if not self.negative_sample_dir or not self.negative_sample_dir.exists():
             return []
         
+        
         image_files = []
+        # 負樣本圖片存放在 negative_sample_dir/images 目錄下
+        neg_img_dir = self.negative_sample_dir / "images"
+        if not neg_img_dir.exists():
+            # 相容模式：如果沒有 images 子目錄，嘗試直接在根目錄找
+            neg_img_dir = self.negative_sample_dir
+            
         for ext in self.IMAGE_EXTENSIONS:
-            image_files.extend(self.negative_sample_dir.glob(f"*{ext}"))
-            image_files.extend(self.negative_sample_dir.glob(f"*{ext.upper()}"))
+            image_files.extend(neg_img_dir.glob(f"*{ext}"))
+            image_files.extend(neg_img_dir.glob(f"*{ext.upper()}"))
         
         return sorted([str(f) for f in image_files])
     
     def _load_negative_sample_annotations(self) -> Dict[str, List[Dict]]:
-        """載入負樣本標註（LabelMe 格式）"""
+        """載入負樣本標註（優先使用 COCO 格式，否則使用 LabelMe 格式）"""
         if not self.negative_sample_dir or not self.negative_sample_dir.exists():
             return {}
         
         annotations_dict = {}
+        
+        # 優先檢查 COCO 格式（annotations.json）
+        coco_file = self.negative_sample_dir / "annotations.json"
+        if coco_file.exists():
+            try:
+                with open(coco_file, 'r', encoding='utf-8') as f:
+                    coco_data = json.load(f)
+                
+                # 檢查是否為 COCO 格式
+                if 'images' in coco_data and 'annotations' in coco_data and 'categories' in coco_data:
+                    # 建立 category_id 到 category_name 的映射
+                    category_id_to_name = {
+                        cat['id']: cat['name']
+                        for cat in coco_data.get('categories', [])
+                    }
+                    
+                    # 建立 image_id 到 filename 的映射
+                    image_id_to_filename = {
+                        img['id']: img['file_name']
+                        for img in coco_data.get('images', [])
+                    }
+                    
+                    # 載入標註
+                    for ann in coco_data.get('annotations', []):
+                        image_id = ann['image_id']
+                        filename = image_id_to_filename.get(image_id)
+                        
+                        if filename is None:
+                            continue
+                        
+                        # 確保圖片檔案存在
+                        image_path = self.negative_sample_dir / filename
+                        if not image_path.exists():
+                            # 嘗試其他擴展名
+                            found = False
+                            for ext in self.IMAGE_EXTENSIONS:
+                                alt_path = self.negative_sample_dir / (Path(filename).stem + ext)
+                                if alt_path.exists():
+                                    filename = alt_path.name
+                                    found = True
+                                    break
+                            if not found:
+                                logger.debug(f"負樣本 COCO 標註: 找不到對應的圖片檔案 {filename}，跳過")
+                                continue
+                        
+                        if filename not in annotations_dict:
+                            annotations_dict[filename] = []
+                        
+                        # 獲取類別名稱
+                        category_id = ann['category_id']
+                        category_name = category_id_to_name.get(category_id, '')
+                        
+                        # 添加標註（包含 category_name 以便後續過濾）
+                        annotations_dict[filename].append({
+                            'id': ann['id'],
+                            'image_id': image_id,
+                            'category_id': category_id,
+                            'category_name': category_name,  # 保存類別名稱
+                            'bbox': ann['bbox'],  # COCO 格式: [x, y, width, height]
+                            'area': ann.get('area', ann['bbox'][2] * ann['bbox'][3]),
+                            'iscrowd': ann.get('iscrowd', 0)
+                        })
+                    
+                    logger.info(f"從 COCO 格式載入負樣本標註: {coco_file}")
+                    return annotations_dict
+                    
+            except Exception as e:
+                logger.warning(f"無法載入負樣本 COCO 標註 {coco_file}: {e}，嘗試 LabelMe 格式")
+        
+        # 如果沒有 COCO 格式，嘗試 LabelMe 格式（向後兼容）
         category_name_to_id = {}  # 臨時映射，後續會與主標註合併
         next_category_id = 1
         
@@ -214,6 +277,10 @@ class FasterRCNNDataset(Dataset):
         json_files = list(self.negative_sample_dir.glob("*.json"))
         
         for json_file in json_files:
+            # 跳過 annotations.json（已經處理過）
+            if json_file.name == "annotations.json":
+                continue
+                
             try:
                 with open(json_file, 'r', encoding='utf-8') as f:
                     labelme_data = json.load(f)
@@ -303,6 +370,9 @@ class FasterRCNNDataset(Dataset):
             except Exception as e:
                 logger.warning(f"無法載入負樣本標註 {json_file.name}: {e}")
                 continue
+        
+        if annotations_dict:
+            logger.info(f"從 LabelMe 格式載入負樣本標註: {len(json_files)} 個檔案")
         
         return annotations_dict
     
@@ -736,9 +806,18 @@ class FasterRCNNDataset(Dataset):
         
         # 檢查圖片路徑是否存在（可能是負樣本，路徑不同）
         if not image_path.exists():
-            # 如果是負樣本，路徑在 negative_sample_dir
-            if self.negative_sample_dir and (self.negative_sample_dir / filename).exists():
-                image_path = self.negative_sample_dir / filename
+            # 如果是負樣本，路徑可能在 negative_sample_dir 或 negative_sample_dir/images
+            if self.negative_sample_dir:
+                neg_paths = [
+                    self.negative_sample_dir / filename,
+                    self.negative_sample_dir / "images" / filename
+                ]
+                for p in neg_paths:
+                    if p.exists():
+                        image_path = p
+                        break
+                else:
+                    raise FileNotFoundError(f"找不到圖片檔案: {self.image_files[idx]}")
             else:
                 raise FileNotFoundError(f"找不到圖片檔案: {self.image_files[idx]}")
         
@@ -971,14 +1050,16 @@ def create_data_loader(
 ) -> DataLoader:
     
     if num_workers is None:
-        num_workers = min(MAX_NUM_WORKERS, os.cpu_count() or 1)
+        # 記憶體受限時減少 worker 數量
+        num_workers = min(2, os.cpu_count() or 1)  # 減少到最多 2 個 worker
     
     if pin_memory is None:
-        pin_memory = torch.cuda.is_available()
+        # 記憶體受限時關閉 pin_memory
+        pin_memory = False  # 關閉以節省記憶體
     
-    # RTX 5090 優化：增加預取因子以充分利用 GPU
+    # 記憶體受限時減少預取因子
     if prefetch_factor is None:
-        prefetch_factor = 4 if num_workers > 0 else None
+        prefetch_factor = 2 if num_workers > 0 else None  # 從 4 降到 2
     
     return DataLoader(
         dataset,
@@ -1052,13 +1133,6 @@ class FasterRCNNTrainer:
             # 啟用 TensorFloat-32 (TF32) 以加速訓練（RTX 5090 支持）
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            
-            # 顯示 GPU 資訊
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            logger.info(f"GPU 設備: {gpu_name}")
-            logger.info(f"GPU 記憶體: {gpu_memory:.2f} GB")
-            logger.info("已啟用 CUDNN benchmark 和 TF32 加速")
         
         logger.info(f"模型已載入到設備: {self.device}")
         
@@ -1103,8 +1177,8 @@ class FasterRCNNTrainer:
         # 訓練集啟用資料擴增，驗證集關閉（已改為全域關閉）
         enable_aug = AUGMENTATION_ENABLED  # 使用全域設定，目前為 False
         
-        # 只在訓練集添加負樣本，驗證集不添加
-        negative_dir = self.negative_sample_dir if dataset_name == "訓練集" else None
+        # 在訓練集和驗證集都添加負樣本
+        negative_dir = self.negative_sample_dir
         
         dataset = FasterRCNNDataset(
             image_dir=str(image_dir),
@@ -1289,7 +1363,6 @@ class FasterRCNNTrainer:
                 backoff_factor=0.5,  # 回退因子
                 growth_interval=2000  # 增長間隔
             )
-            logger.info("已啟用混合精度訓練 (AMP) 以加速訓練（RTX 5090 優化）")
         else:
             scaler = None
         return use_amp, scaler
@@ -1311,6 +1384,10 @@ class FasterRCNNTrainer:
         # 清理 GPU 記憶體快取（避免記憶體碎片化）
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            # 顯示當前 GPU 記憶體使用情況
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            logger.info(f"GPU 記憶體: 已分配 {allocated:.2f} GB, 已保留 {reserved:.2f} GB")
         
         for epoch in range(config.num_epochs):
             logger.info(f"\nEpoch {epoch + 1}/{config.num_epochs}")
@@ -1349,10 +1426,12 @@ class FasterRCNNTrainer:
                 train_loss += losses.item()
                 train_batches += 1
                 
-                # 定期清理 GPU 記憶體快取（每 10 個 batch）
+                # 每個 batch 後清理 GPU 記憶體快取（記憶體受限時需要更頻繁清理）
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # 定期顯示進度（每 10 個 batch）
                 if (batch_idx + 1) % 10 == 0:
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     logger.info(f"  Batch {batch_idx + 1}/{len(train_loader)}, Loss: {losses.item():.4f}")
             
             avg_train_loss = train_loss / train_batches if train_batches > 0 else 0.0
@@ -1391,7 +1470,7 @@ class FasterRCNNTrainer:
             # 保存最佳模型
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                logger.info(f"  ✓ 發現更好的模型（驗證損失: {best_val_loss:.4f}）")
+                logger.info(f"  驗證損失: {best_val_loss:.4f}")
             
             # 每個 epoch 結束後清理 GPU 記憶體快取
             if torch.cuda.is_available():
@@ -1459,7 +1538,7 @@ def main():
         # 開始訓練（RTX 5090 優化配置）
         config = TrainingConfig(
             num_epochs=10,
-            batch_size=8,  # 降低批次大小以避免 CUDA 記憶體不足
+            batch_size=2,  # 降低批次大小以避免 CUDA 記憶體不足（多進程環境）
             learning_rate=0.005
         )
         model_path = trainer.train(config=config)
