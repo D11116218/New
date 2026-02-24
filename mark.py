@@ -46,7 +46,7 @@ class DetectionConfig:
     CATEGORY_THRESHOLDS = {
         'RFID': 0.5,
         'colony': 0.365,
-        'point': 0.22
+        'point': 0.48
     }
     
     # 預處理配置（與 model.py 保持一致）
