@@ -267,10 +267,6 @@ class AnnotationConverter:
                     json_file = potential_json
                     break
             
-            if json_file is None:
-                print(f"  [{image_id}/{len(image_files)}] {img_file.name}: 未找到對應的 JSON 檔案，跳過")
-                continue
-            
             # 讀取圖片
             try:
                 image = Image.open(img_file).convert("RGB")
@@ -298,7 +294,7 @@ class AnnotationConverter:
                 "width": image_width,
                 "height": image_height
             })
-            
+
             # 添加標註
             for ann in converted_data['annotations']:
                 bbox = ann['bbox']
@@ -318,9 +314,7 @@ class AnnotationConverter:
                 })
                 annotation_id += 1
                 total_annotations += 1
-            
             converted_count += 1
-            print(f"  [{image_id}/{len(image_files)}] {img_file.name}: 轉換成功 ({len(converted_data['annotations'])} 個標註)")
             image_id += 1
         
         # 保存 COCO 格式 JSON
@@ -341,11 +335,6 @@ class AnnotationConverter:
         print("=" * 60)
         print(f"總圖片數: {len(image_files)}")
         print(f"成功轉換: {converted_count} 張")
-        print(f"總標註數: {total_annotations} 個")
-        print(f"類別數: {len(coco_categories)} 個")
-        print(f"類別列表: {[cat['name'] for cat in coco_categories]}")
-        print(f"輸出檔案: {output_json_path}")
-        print(f"輸出圖片目錄: {self.output_images_dir}")
         print()
         
         return {
@@ -358,14 +347,8 @@ class AnnotationConverter:
         }
 
 def main():
-    
-    print("標註格式轉換工具：轉換為 COCO 格式")
-    print()
-    print("使用說明：")
-    print("1. 將手動標記的圖片和 JSON 檔案放在 c1/ 目錄")
-    print("2. 執行此腳本進行轉換")
-    print("3. 轉換後的 COCO 格式會輸出到 c2/ 目錄")
-    print()
+
+
     
     # 創建轉換器（可以自訂類別名稱）
     converter = AnnotationConverter(
@@ -379,9 +362,6 @@ def main():
     
     if result["success"]:
         print("✓ 轉換完成！")
-        print(f"\n轉換後的檔案位置：")
-        print(f"  - COCO JSON: {result['output_json']}")
-        print(f"  - 圖片目錄: {result['output_images_dir']}")
         
         # 刪除 c1/ 目錄中的所有資料
         c1_dir = Path("c1")

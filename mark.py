@@ -45,14 +45,14 @@ class DetectionConfig:
     # 類別特定閾值
     CATEGORY_THRESHOLDS = {
         'RFID': 0.5,
-        'colony': 0.365,
+        'colony': 0.31,
         'point': 0.48
     }
     
     # 預處理配置（與 model.py 保持一致）
     PREPROCESS_DENOISE_STRENGTH = 10  # 降噪強度
     PREPROCESS_SHARPEN_RADIUS = 5    # 銳化半徑
-    PREPROCESS_CONTRAST_ALPHA = 1.0   # 對比度增強係數
+    PREPROCESS_CONTRAST_ALPHA = 1.0   # 對比度增強係數ˋ
     
     # 同類別 NMS 配置(數值高， 越不積極)
     SAME_CLASS_NMS_ENABLED = True
@@ -120,12 +120,6 @@ class FasterRCNNDetector:
             torch.backends.cudnn.deterministic = False
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            logger.info(f"GPU 設備: {gpu_name}")
-            logger.info(f"GPU 記憶體: {gpu_memory:.2f} GB")
-            logger.info("已啟用 CUDNN benchmark 和 TF32 加速")
         
         # 載入模型
         if model_path is None:
@@ -189,7 +183,6 @@ class FasterRCNNDetector:
         model_full_file = self.model_path / "model_full.pth"
         
         if model_full_file.exists():
-            logger.info(f"載入完整模型: {model_full_file}")
             # PyTorch 2.6+ 需要設置 weights_only=False 來載入完整模型
             model = torch.load(model_full_file, map_location=self.device, weights_only=False)
         elif model_file.exists():
@@ -507,15 +500,6 @@ class FasterRCNNDetector:
                 category_name = self.category_names.get(int(label_id), f"class_{label_id}")
                 logger.info(f"  {category_name} (id={label_id}): {label_mask.sum()} 個偵測")
                 logger.info(f"    信心值範圍: {label_scores.min().item():.4f} ~ {label_scores.max().item():.4f}")
-                # 對於 colony 和 RFID，顯示更多統計信息
-                if category_name in ['colony', 'RFID']:
-                    threshold = thresholds_dict.get(category_name, 0.3) if use_category_thresholds else global_threshold
-                    above_threshold = (label_scores >= threshold).sum().item()
-                    below_threshold = (label_scores < threshold).sum().item()
-                    if below_threshold > 0:
-                        below_scores = label_scores[label_scores < threshold]
-                        logger.info(f"    高於閾值 {threshold:.3f}: {above_threshold} 個")
-                        logger.info(f"    低於閾值 {threshold:.3f}: {below_threshold} 個（範圍: {below_scores.min().item():.4f} ~ {below_scores.max().item():.4f}）")
         logger.info("=" * 60)
         
         if use_category_thresholds:
@@ -924,18 +908,7 @@ class FasterRCNNDetector:
                     labels = labels[keep_indices]
                     scores = scores[keep_indices]
                     
-                    total_after_same_class = len(boxes)
-                    removed_total = total_before_same_class - total_after_same_class
-                    
-                    if removed_total > 0:
-                        logger.info(
-                            f"同類別 NMS 完成: 原始 {total_before_same_class} 個檢測，"
-                            f"移除 {removed_total} 個重疊檢測，"
-                            f"保留 {total_after_same_class} 個"
-                        )
-                    else:
-                        logger.info(f"同類別 NMS: 無重疊檢測，保留所有 {total_before_same_class} 個檢測")
-        
+
         # 跨類別 NMS：對所有檢測框進行 NMS，不管類別
         if DetectionConfig.CROSS_CLASS_NMS_ENABLED and len(boxes) > 1:
             total_before = len(boxes)

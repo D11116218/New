@@ -128,7 +128,9 @@ class FasterRCNNDataset(Dataset):
                 
                 # 合併負樣本圖片到訓練集
                 self.image_files.extend(negative_image_files)
-                logger.info(f"已載入 {len(negative_image_files)} 張負樣本圖片")
+        
+        # 記錄負樣本路徑集合（用於 __getitem__ 強制套用擴增）
+        self.negative_image_set = set(negative_image_files) if negative_image_files else set()
         
         # 載入標註
         self.annotations = {}
@@ -154,9 +156,6 @@ class FasterRCNNDataset(Dataset):
                         ann['category_id'] = 0  # 背景類別
                         self.annotations[filename].append(ann)
                         text_count += 1
-                
-                if text_count > 0:
-                    logger.info(f"負樣本 {filename}: 添加了 {text_count} 個 text 標註（映射為背景類別 ID: 0）")
         
         # 準備 grayscale 目錄（用於保存灰階圖片）
         if SAVE_GRAYSCALE:
@@ -262,8 +261,6 @@ class FasterRCNNDataset(Dataset):
                             'area': ann.get('area', ann['bbox'][2] * ann['bbox'][3]),
                             'iscrowd': ann.get('iscrowd', 0)
                         })
-                    
-                    logger.info(f"從 COCO 格式載入負樣本標註: {coco_file}")
                     return annotations_dict
                     
             except Exception as e:
@@ -370,9 +367,6 @@ class FasterRCNNDataset(Dataset):
             except Exception as e:
                 logger.warning(f"無法載入負樣本標註 {json_file.name}: {e}")
                 continue
-        
-        if annotations_dict:
-            logger.info(f"從 LabelMe 格式載入負樣本標註: {len(json_files)} 個檔案")
         
         return annotations_dict
     
@@ -889,8 +883,9 @@ class FasterRCNNDataset(Dataset):
             boxes_array = np.zeros((0, 4), dtype=np.float32)
             labels_list = []
         
-        # 應用資料擴增（如果啟用）
-        if self.enable_augmentation:
+        # 應用資料擴增：啟用條件為 (全域設定開啟) 或 (當前圖片為負樣本)
+        is_negative = str(self.image_files[idx]) in self.negative_image_set
+        if self.enable_augmentation or is_negative:
             processed_rgb, boxes_array = self._apply_augmentation(
                 processed_rgb,
                 boxes_array,
@@ -1187,18 +1182,6 @@ class FasterRCNNTrainer:
             enable_augmentation=enable_aug,
             negative_sample_dir=negative_dir
         )
-        
-        logger.info(f"  {dataset_name}大小: {len(dataset)} 張圖像")
-        if enable_aug:
-            logger.info(f"  資料擴增: 已啟用（平移±{AUGMENTATION_TRANSLATE_PERCENT*100:.0f}%, "
-                       f"縮放{AUGMENTATION_SCALE_MIN:.1f}-{AUGMENTATION_SCALE_MAX:.1f}, "
-                       f"旋轉±{AUGMENTATION_ROTATE_DEGREES:.0f}度, "
-                       f"水平翻轉{AUGMENTATION_FLIP_HORIZONTAL_PROB*100:.0f}%, "
-                       f"垂直翻轉{AUGMENTATION_FLIP_VERTICAL_PROB*100:.0f}%）")
-        else:
-            logger.info(f"  資料擴增: 已關閉")
-        if SAVE_GRAYSCALE:
-            logger.info(f"  灰階圖片將保存到: grayscale/{dataset_name}/images/")
         return dataset
     
     def prepare_datasets(self):
@@ -1298,8 +1281,6 @@ class FasterRCNNTrainer:
             prefetch_factor=4
         )
         
-        logger.info(f"數據加載器配置: num_workers={train_loader.num_workers}, pin_memory={train_loader.pin_memory}")
-        
         # 設置優化器和學習率調度器
         optimizer, lr_scheduler = self._create_optimizer_and_scheduler(config)
         
@@ -1346,7 +1327,6 @@ class FasterRCNNTrainer:
         logger.info("訓練參數:")
         logger.info(f"  輪數: {config.num_epochs}")
         logger.info(f"  批次大小: {config.batch_size}")
-        logger.info(f"  學習率: {config.learning_rate}")
         logger.info(f"  輸出目錄: {self.output_dir}")
         logger.info(f"  訓練樣本: {len(self.train_dataset)}")
         logger.info(f"  驗證樣本: {len(self.val_dataset)}")
