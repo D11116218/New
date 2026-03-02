@@ -89,7 +89,7 @@ class FasterRCNNDataset(Dataset):
         rotate_degrees: float = AUGMENTATION_ROTATE_DEGREES,
         flip_horizontal_prob: float = AUGMENTATION_FLIP_HORIZONTAL_PROB,
         flip_vertical_prob: float = AUGMENTATION_FLIP_VERTICAL_PROB,
-        negative_sample_dir: Optional[str] = None  # 負樣本目錄（nsamples）
+        negative_sample_dir: Optional[str] = "c2"  # 負樣本目錄，預設改為 c2
     ):
         
         self.image_dir = Path(image_dir)
@@ -146,11 +146,11 @@ class FasterRCNNDataset(Dataset):
                 if filename not in self.annotations:
                     self.annotations[filename] = []
                 
-                # 只添加 text 標註，過濾掉其他類別
+                # 添加 text 與 text2 標註，過濾掉其他類別
                 text_count = 0
                 for ann in anns:
                     category_name = ann.get('category_name', '')
-                    if category_name == 'text':
+                    if category_name in ['text', 'text2']:
                         # 將 text 映射為背景類別（類別 ID 0）
                         # 這樣模型會學習這些區域不應該被檢測為任何類別
                         ann['category_id'] = 0  # 背景類別

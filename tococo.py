@@ -10,7 +10,7 @@ from PIL import Image
 class AnnotationConverter:
     
     
-    def __init__(self, input_dir: str = "c1", output_dir: str = "nsamples", category_name: str = "object"):
+    def __init__(self, input_dir: str = "c1", output_dir: str = "c2", category_name: str = "object"):
         
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
@@ -103,6 +103,9 @@ class AnnotationConverter:
     def convert_labelme_file(self, json_path: Path, image_path: Path) -> Optional[Dict]:
         
         try:
+            if json_path is None:
+                return None
+                
             with open(json_path, 'r', encoding='utf-8') as f:
                 labelme_data = json.load(f)
             
@@ -140,7 +143,8 @@ class AnnotationConverter:
             }
             
         except Exception as e:
-            print(f"  錯誤: 轉換 {json_path.name} 時發生錯誤: {str(e)}")
+            file_name = json_path.name if json_path else image_path.name
+            print(f"  錯誤: 轉換 {file_name} 時發生錯誤: {str(e)}")
             return None
     
     def convert_single_json(self, json_path: Path) -> Optional[Dict]:
@@ -324,6 +328,7 @@ class AnnotationConverter:
             "categories": coco_categories
         }
         
+        # 執行後產生coco格式的路徑
         output_json_path = self.output_dir / "annotations.json"
         with open(output_json_path, 'w', encoding='utf-8') as f:
             json.dump(coco_data, f, indent=2, ensure_ascii=False)
@@ -353,7 +358,7 @@ def main():
     # 創建轉換器（可以自訂類別名稱）
     converter = AnnotationConverter(
         input_dir="c1",
-        output_dir="nsamples",
+        output_dir="c2",
         category_name="object"  # 如果您的類別名稱不同，請修改這裡
     )
     
